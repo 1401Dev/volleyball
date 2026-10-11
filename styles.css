@@ -91,6 +91,31 @@ header::after {
     font-weight: 600;
     margin-top: 0.25rem;
 }
+.auth-chip {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+}
+.auth-chip .avatar {
+    width: 28px;
+    height: 28px;
+    border-radius: 50%;
+    border: 1px solid var(--border-strong);
+}
+.auth-chip .user-email {
+    font-size: 0.78rem;
+    color: var(--text-dim);
+    font-weight: 500;
+    max-width: 180px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+@media (max-width: 600px) {
+    .auth-chip .user-email { display: none; }
+}
 nav {
     display: flex;
     gap: 0;
@@ -470,6 +495,16 @@ button.icon-btn:hover { background: var(--surface-2); color: var(--danger); }
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.04em;
+}
+.roster-name-static {
+    flex: 1;
+    font-family: var(--display);
+    font-weight: 700;
+    font-size: 1rem;
+    color: var(--text);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    padding: 0.5rem 0;
 }
 .roster-bar button {
     padding: 0.6rem 0.9rem;

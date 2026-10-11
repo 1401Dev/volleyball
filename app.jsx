@@ -1,4 +1,24 @@
-const { useState, useEffect, useMemo } = React;
+const { useState, useEffect, useMemo, useRef } = React;
+
+// --- Firebase setup ---------------------------------------------------------
+// Paste the config object from Firebase Console → Project Settings → Your apps.
+const firebaseConfig = {
+  apiKey: "AIzaSyAWkcpebdnKflKKLeIIUo9ACr2WGy0y7VY",
+  authDomain: "sport-organize.firebaseapp.com",
+  projectId: "sport-organize",
+  storageBucket: "sport-organize.firebasestorage.app",
+  messagingSenderId: "122207828807",
+  appId: "1:122207828807:web:2a7d6b821fdef7aebcaa62"
+};
+firebase.initializeApp(firebaseConfig);
+const auth = firebase.auth();
+const db = firebase.firestore();
+// Enable offline cache so the app still works without a connection.
+db.enablePersistence({ synchronizeTabs: true }).catch(() => {});
+const googleProvider = new firebase.auth.GoogleAuthProvider();
+// Only this user can edit; everyone else sees a read-only view.
+const ADMIN_UID = "GiQwaYz7zGeG2bipauadUFO36NI3";
+// ---------------------------------------------------------------------------
 
 const STORAGE_KEY = "volleyball-organizer-v3";
 const LEGACY_KEY_V2 = "volleyball-organizer-v2";
@@ -641,6 +661,82 @@ function HistoryView({ sessions, members, deleteSession }) {
     );
 }
 
+function PublicMembersView({ members }) {
+    const sorted = [...members].sort((a, b) => a.name.localeCompare(b.name));
+    return (
+        <div className="card">
+            <h2>Members ({sorted.length})</h2>
+            {sorted.length === 0 ? (
+                <div className="empty">No members yet.</div>
+            ) : (
+                <div className="member-list">
+                    {sorted.map(m => (
+                        <div className="member-row" key={m.id}>
+                            <span className="member-name">{m.name}</span>
+                        </div>
+                    ))}
+                </div>
+            )}
+        </div>
+    );
+}
+
+function PublicHistoryView({ sessions, members }) {
+    const nameFor = (id) => members.find(m => m.id === id);
+    const [expanded, setExpanded] = useState(null);
+    const sorted = [...sessions].sort((a, b) => b.date.localeCompare(a.date));
+
+    if (sorted.length === 0) {
+        return (
+            <div className="card">
+                <div className="empty">No saved sessions yet.</div>
+            </div>
+        );
+    }
+    return (
+        <div className="card">
+            <h2>Past Sessions</h2>
+            {sorted.map(s => (
+                <div key={s.id}>
+                    <div className="session-row" onClick={() => setExpanded(expanded === s.id ? null : s.id)}>
+                        <div className="session-date">{formatDate(s.date)}</div>
+                        <div className="session-meta">
+                            {s.available.length} players · {s.teams ? `${s.teams.length} teams` : "no teams"}
+                        </div>
+                    </div>
+                    {expanded === s.id && s.teams && (
+                        <div style={{ padding: "0 0.5rem 1rem" }}>
+                            <div className="teams-grid">
+                                {s.teams.map((teamIds, i) => {
+                                    const team = teamIds.map(id => nameFor(id)).filter(Boolean);
+                                    return (
+                                        <div key={i} className={`team team-${i + 1}`}>
+                                            <div className="team-header">
+                                                <div className="jersey">{String.fromCharCode(65 + i)}</div>
+                                                <div className="team-title">
+                                                    <span className="name">Team {String.fromCharCode(65 + i)}</span>
+                                                    <span className="meta">{team.length} Players</span>
+                                                </div>
+                                            </div>
+                                            <div className="team-players">
+                                                {team.map(p => (
+                                                    <div key={p.id} className="team-player" style={{ cursor: "default" }}>
+                                                        <span>{p.name}</span>
+                                                    </div>
+                                                ))}
+                                            </div>
+                                        </div>
+                                    );
+                                })}
+                            </div>
+                        </div>
+                    )}
+                </div>
+            ))}
+        </div>
+    );
+}
+
 function App() {
     const stored = loadState();
     const initial = stored || {
@@ -655,10 +751,70 @@ function App() {
     const [activeRosterId, setActiveRosterId] = useState(initial.activeRosterId);
     const [tab, setTab] = useState("week");
     const [toast, setToast] = useState(null);
+    const [user, setUser] = useState(null);
+    const [authReady, setAuthReady] = useState(false);
+    const [cloudReady, setCloudReady] = useState(false);
+    // Last payload we know matches Firestore — prevents snapshot↔save loops.
+    const lastSyncedRef = useRef(null);
 
+    // Track sign-in state
+    useEffect(() => {
+        return auth.onAuthStateChanged(u => {
+            setUser(u);
+            setAuthReady(true);
+            if (!u) {
+                setCloudReady(false);
+                lastSyncedRef.current = null;
+            }
+        });
+    }, []);
+
+    // Subscribe to the admin's Firestore doc — same for everyone (public read).
+    useEffect(() => {
+        const docRef = db.collection("users").doc(ADMIN_UID);
+        const unsub = docRef.onSnapshot(snap => {
+            const data = snap.exists ? snap.data() : null;
+            if (!data?.state) { setCloudReady(true); return; }
+            const normalized = normalizeState(data.state);
+            if (!normalized) { setCloudReady(true); return; }
+            const serialized = JSON.stringify(normalized);
+            if (serialized !== lastSyncedRef.current) {
+                lastSyncedRef.current = serialized;
+                setRosters(normalized.rosters);
+                setActiveRosterId(normalized.activeRosterId);
+            }
+            setCloudReady(true);
+        }, err => console.error("Firestore sync error:", err));
+        return unsub;
+    }, []);
+
+    // Save: localStorage always; Firestore only when signed in AS admin (debounced).
     useEffect(() => {
         saveState({ rosters, activeRosterId });
-    }, [rosters, activeRosterId]);
+        if (user?.uid !== ADMIN_UID || !cloudReady) return;
+        const payload = { rosters, activeRosterId };
+        const serialized = JSON.stringify(payload);
+        if (serialized === lastSyncedRef.current) return;
+        const t = setTimeout(() => {
+            lastSyncedRef.current = serialized;
+            db.collection("users").doc(ADMIN_UID).set({
+                state: payload,
+                updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
+            }, { merge: true }).catch(err => console.error("Firestore save error:", err));
+        }, 500);
+        return () => clearTimeout(t);
+    }, [rosters, activeRosterId, user, cloudReady]);
+
+    const signIn = () => auth.signInWithPopup(googleProvider)
+        .catch(err => alert("Sign-in failed: " + err.message));
+    const signOut = () => auth.signOut();
+
+    const isAdmin = user?.uid === ADMIN_UID;
+
+    // Non-admins can't see "This Week"; bounce them to Members.
+    useEffect(() => {
+        if (!isAdmin && tab === "week") setTab("members");
+    }, [isAdmin, tab]);
 
     const activeRoster = rosters.find(r => r.id === activeRosterId) || rosters[0];
 
@@ -801,52 +957,95 @@ function App() {
                         <span className="logo-sub">Team Manager</span>
                     </div>
                 </div>
+                {authReady && (
+                    <div className="auth-chip">
+                        {user ? (
+                            <>
+                                {user.photoURL && <img src={user.photoURL} alt="" className="avatar" referrerPolicy="no-referrer" />}
+                                <span className="user-email" title={user.email}>{user.email}</span>
+                                <button className="btn btn-secondary" onClick={signOut}>Sign out</button>
+                            </>
+                        ) : (
+                            <button className="btn" onClick={signIn}>Admin sign in</button>
+                        )}
+                    </div>
+                )}
             </header>
-            <div className="roster-bar">
-                <span className="roster-label">Roster</span>
-                <select value={activeRoster.id} onChange={e => setActiveRosterId(e.target.value)}>
-                    {rosters.map(r => (
-                        <option key={r.id} value={r.id}>{r.name}</option>
-                    ))}
-                </select>
-                <button onClick={createRoster} title="New roster">+ New</button>
-                <button onClick={renameRoster} title="Rename this roster">Rename</button>
-                <button className="danger" onClick={deleteRoster} title="Delete this roster">Delete</button>
-                <span className="roster-divider" aria-hidden="true"></span>
-                <button onClick={exportBackup} title="Download all data as a JSON file">Backup</button>
-                <button onClick={importBackup} title="Restore from a backup file">Restore</button>
-            </div>
-            <nav>
-                <button className={tab === "week" ? "active" : ""} onClick={() => setTab("week")}>This Week</button>
-                <button className={tab === "members" ? "active" : ""} onClick={() => setTab("members")}>Members</button>
-                <button className={tab === "history" ? "active" : ""} onClick={() => setTab("history")}>History</button>
-            </nav>
-            {tab === "week" && (
-                <ThisWeekView
-                    key={activeRoster.id}
-                    members={activeRoster.members}
-                    currentSession={activeRoster.currentSession}
-                    setCurrentSession={setCurrentSession}
-                    saveSession={saveSession}
-                    showToast={setToast}
-                />
+
+            {isAdmin ? (
+                <>
+                    <div className="roster-bar">
+                        <span className="roster-label">Roster</span>
+                        <select value={activeRoster.id} onChange={e => setActiveRosterId(e.target.value)}>
+                            {rosters.map(r => (
+                                <option key={r.id} value={r.id}>{r.name}</option>
+                            ))}
+                        </select>
+                        <button onClick={createRoster} title="New roster">+ New</button>
+                        <button onClick={renameRoster} title="Rename this roster">Rename</button>
+                        <button className="danger" onClick={deleteRoster} title="Delete this roster">Delete</button>
+                        <span className="roster-divider" aria-hidden="true"></span>
+                        <button onClick={exportBackup} title="Download all data as a JSON file">Backup</button>
+                        <button onClick={importBackup} title="Restore from a backup file">Restore</button>
+                    </div>
+                    <nav>
+                        <button className={tab === "week" ? "active" : ""} onClick={() => setTab("week")}>This Week</button>
+                        <button className={tab === "members" ? "active" : ""} onClick={() => setTab("members")}>Members</button>
+                        <button className={tab === "history" ? "active" : ""} onClick={() => setTab("history")}>History</button>
+                    </nav>
+                    {tab === "week" && (
+                        <ThisWeekView
+                            key={activeRoster.id}
+                            members={activeRoster.members}
+                            currentSession={activeRoster.currentSession}
+                            setCurrentSession={setCurrentSession}
+                            saveSession={saveSession}
+                            showToast={setToast}
+                        />
+                    )}
+                    {tab === "members" && (
+                        <MembersView
+                            key={activeRoster.id}
+                            members={activeRoster.members}
+                            setMembers={setMembers}
+                            resetToPreset={resetToPreset}
+                        />
+                    )}
+                    {tab === "history" && (
+                        <HistoryView
+                            key={activeRoster.id}
+                            sessions={activeRoster.sessions}
+                            members={activeRoster.members}
+                            deleteSession={deleteSession}
+                        />
+                    )}
+                </>
+            ) : (
+                <>
+                    <div className="roster-bar">
+                        <span className="roster-label">Roster</span>
+                        <span className="roster-name-static">{activeRoster?.name || "—"}</span>
+                    </div>
+                    <nav>
+                        <button className={tab === "members" ? "active" : ""} onClick={() => setTab("members")}>Members</button>
+                        <button className={tab === "history" ? "active" : ""} onClick={() => setTab("history")}>History</button>
+                    </nav>
+                    {tab === "members" && (
+                        <PublicMembersView
+                            key={activeRoster?.id}
+                            members={activeRoster?.members || []}
+                        />
+                    )}
+                    {tab === "history" && (
+                        <PublicHistoryView
+                            key={activeRoster?.id}
+                            sessions={activeRoster?.sessions || []}
+                            members={activeRoster?.members || []}
+                        />
+                    )}
+                </>
             )}
-            {tab === "members" && (
-                <MembersView
-                    key={activeRoster.id}
-                    members={activeRoster.members}
-                    setMembers={setMembers}
-                    resetToPreset={resetToPreset}
-                />
-            )}
-            {tab === "history" && (
-                <HistoryView
-                    key={activeRoster.id}
-                    sessions={activeRoster.sessions}
-                    members={activeRoster.members}
-                    deleteSession={deleteSession}
-                />
-            )}
+
             {toast && <Toast message={toast} onDone={() => setToast(null)} />}
         </div>
     );
