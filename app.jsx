@@ -862,7 +862,7 @@ function App() {
             alert("A roster with that name already exists.");
             return;
         }
-        updateActive({ name });
+        patchActive(r => ({ ...r, name }));
         setToast("Roster renamed");
     };
 
@@ -966,7 +966,7 @@ function App() {
                                 <button className="btn btn-secondary" onClick={signOut}>Sign out</button>
                             </>
                         ) : (
-                            <button className="btn" onClick={signIn}>Admin sign in</button>
+                            <button className="btn" onClick={signIn}>Sign in</button>
                         )}
                     </div>
                 )}
