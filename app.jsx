@@ -780,6 +780,9 @@ function App() {
 
     const [rosters, setRosters] = useState(initial.rosters);
     const [activeRosterId, setActiveRosterId] = useState(initial.activeRosterId);
+    // Non-admin viewers can switch which roster they're looking at without
+    // affecting the admin's active roster. Null = follow admin's active roster.
+    const [viewingRosterId, setViewingRosterId] = useState(null);
     const [tab, setTab] = useState("week");
     const [toast, setToast] = useState(null);
     const [user, setUser] = useState(null);
@@ -884,6 +887,7 @@ function App() {
     }, [isAdmin, tab]);
 
     const activeRoster = rosters.find(r => r.id === activeRosterId) || rosters[0];
+    const viewingRoster = rosters.find(r => r.id === viewingRosterId) || activeRoster;
 
     const patchActive = (updater) => {
         setRosters(prev => prev.map(r => r.id === activeRosterId ? updater(r) : r));
@@ -1091,7 +1095,18 @@ function App() {
                 <>
                     <div className="roster-bar">
                         <span className="roster-label">Roster</span>
-                        <span className="roster-name-static">{activeRoster?.name || "—"}</span>
+                        {rosters.length > 1 ? (
+                            <select
+                                value={viewingRoster?.id || ""}
+                                onChange={e => setViewingRosterId(e.target.value)}
+                            >
+                                {rosters.map(r => (
+                                    <option key={r.id} value={r.id}>{r.name}</option>
+                                ))}
+                            </select>
+                        ) : (
+                            <span className="roster-name-static">{viewingRoster?.name || "—"}</span>
+                        )}
                     </div>
                     <nav>
                         <button className={tab === "members" ? "active" : ""} onClick={() => setTab("members")}>Members</button>
@@ -1099,15 +1114,15 @@ function App() {
                     </nav>
                     {tab === "members" && (
                         <PublicMembersView
-                            key={activeRoster?.id}
-                            members={activeRoster?.members || []}
+                            key={viewingRoster?.id}
+                            members={viewingRoster?.members || []}
                         />
                     )}
                     {tab === "history" && (
                         <PublicHistoryView
-                            key={activeRoster?.id}
-                            sessions={activeRoster?.sessions || []}
-                            members={activeRoster?.members || []}
+                            key={viewingRoster?.id}
+                            sessions={viewingRoster?.sessions || []}
+                            members={viewingRoster?.members || []}
                         />
                     )}
                 </>
