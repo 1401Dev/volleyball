@@ -84,11 +84,16 @@ const decodeSessionFromCloud = (s) => {
 };
 const encodeStateForCloud = (state) => ({
     ...state,
-    rosters: state.rosters.map(r => ({
-        ...r,
-        currentSession: encodeSessionForCloud(r.currentSession),
-        sessions: (r.sessions || []).map(encodeSessionForCloud),
-    })),
+    rosters: state.rosters.map(r => {
+        // Drop any legacy per-roster tournaments; tournaments live at top level.
+        const { tournaments, ...rest } = r;
+        return {
+            ...rest,
+            currentSession: encodeSessionForCloud(rest.currentSession),
+            sessions: (rest.sessions || []).map(encodeSessionForCloud),
+        };
+    }),
+    tournaments: state.tournaments || [],
 });
 const decodeStateFromCloud = (state) => ({
     ...state,
@@ -108,12 +113,23 @@ const normalizeState = (parsed) => {
             members: Array.isArray(r.members) ? r.members : [],
             sessions: Array.isArray(r.sessions) ? r.sessions : [],
             currentSession: r.currentSession || null,
-            tournaments: Array.isArray(r.tournaments) ? r.tournaments.map(normalizeTournament) : [],
         }));
+        // Tournaments live at the top level now (shared across rosters). If the
+        // payload stored them per-roster (older format), fold them in.
+        let tournaments = [];
+        if (Array.isArray(parsed.tournaments)) {
+            tournaments = parsed.tournaments.map(normalizeTournament);
+        } else {
+            parsed.rosters.forEach(r => {
+                if (Array.isArray(r.tournaments)) {
+                    r.tournaments.forEach(t => tournaments.push(normalizeTournament(t)));
+                }
+            });
+        }
         const activeRosterId = rosters.some(r => r.id === parsed.activeRosterId)
             ? parsed.activeRosterId
             : rosters[0].id;
-        return { rosters, activeRosterId };
+        return { rosters, activeRosterId, tournaments };
     }
     return null;
 };
@@ -196,32 +212,66 @@ const nextFriday = () => {
 
 const todayISO = () => new Date().toISOString().slice(0, 10);
 
+const DEFAULT_MATCH_MIN = 11;
+const DEFAULT_TIMEOUT_MIN = 1;
+const TIMEOUTS_PER_TEAM = 2;
+
+// Compute live match-timer state from the shared scoreboard fields.
+// Shared state (synced via Firestore):
+//   timerRunning: bool
+//   timerStartAt: ms timestamp of current run (null when paused)
+//   timerAccumMs: milliseconds accumulated across prior runs
+const computeMatchTime = (state, matchDurationMin, now) => {
+    const durationSec = Math.max(1, matchDurationMin || DEFAULT_MATCH_MIN) * 60;
+    const accum = Number(state?.timerAccumMs) || 0;
+    const liveMs = state?.timerRunning && state?.timerStartAt
+        ? (now - state.timerStartAt) + accum
+        : accum;
+    const elapsedSec = Math.min(durationSec, Math.max(0, Math.floor(liveMs / 1000)));
+    const remainingSec = durationSec - elapsedSec;
+    return { elapsedSec, remainingSec, durationSec, expired: remainingSec === 0, elapsedMs: liveMs };
+};
+const computeTimeoutTime = (state, timeoutDurationMin, now) => {
+    const sec = Math.max(1, timeoutDurationMin || DEFAULT_TIMEOUT_MIN) * 60;
+    if (!state?.timeoutTeam || !state?.timeoutStartAt) {
+        return { active: null, elapsedSec: 0, remainingSec: sec, expired: false };
+    }
+    const elapsedSec = Math.min(sec, Math.max(0, Math.floor((now - state.timeoutStartAt) / 1000)));
+    return { active: state.timeoutTeam, elapsedSec, remainingSec: sec - elapsedSec, expired: elapsedSec >= sec };
+};
+
 const makeTournament = (name, date) => ({
     id: uid(),
     name,
     date: date || todayISO(),
     teams: [],
     matches: [],
-    activeMatch: null,
+    // One active-match slot per scorer (keyed by their uid). Lets multiple
+    // scorers run parallel matches on different courts without clobbering
+    // each other.
+    activeMatches: {},
     endedAt: null,
     createdAt: new Date().toISOString(),
+    matchDurationMin: DEFAULT_MATCH_MIN,
+    timeoutDurationMin: DEFAULT_TIMEOUT_MIN,
 });
 
 // Distinct colors for tournament teams, cycled by team index. Enough for
-// up to 12 teams before repeating.
+// up to 12 teams before repeating. Avoid the app's neon-green accent so the
+// winner highlight and other accented UI don't collide with team branding.
 const TOURNAMENT_TEAM_COLORS = [
     "#FF4D6D", // red
     "#00F0FF", // cyan
     "#FFC107", // amber
-    "#39FF14", // neon green
     "#A855F7", // purple
     "#FB923C", // orange
     "#EC4899", // pink
-    "#10B981", // emerald
-    "#FACC15", // yellow
     "#60A5FA", // blue
     "#F43F5E", // rose
     "#14B8A6", // teal
+    "#F472B6", // light pink
+    "#C084FC", // lavender
+    "#FDBA74", // peach
 ];
 const teamColor = (i) => TOURNAMENT_TEAM_COLORS[((i % TOURNAMENT_TEAM_COLORS.length) + TOURNAMENT_TEAM_COLORS.length) % TOURNAMENT_TEAM_COLORS.length];
 
@@ -256,21 +306,38 @@ const computeStandings = (teams, matches) => {
     });
 };
 
-const normalizeTournament = (t) => ({
-    id: t.id || uid(),
-    name: t.name || "Tournament",
-    date: t.date || todayISO(),
-    teams: Array.isArray(t.teams) ? t.teams.map(team => ({
-        id: team.id || uid(),
-        name: team.name || "Team",
-        // v1 used playerIds (roster refs); v2+ uses free-text players.
-        players: Array.isArray(team.players) ? team.players.filter(p => typeof p === "string") : [],
-    })) : [],
-    matches: Array.isArray(t.matches) ? t.matches : [],
-    activeMatch: t.activeMatch || null,
-    endedAt: t.endedAt || null,
-    createdAt: t.createdAt || new Date().toISOString(),
-});
+const normalizeTournament = (t) => {
+    const activeMatches = {};
+    if (t.activeMatches && typeof t.activeMatches === "object" && !Array.isArray(t.activeMatches)) {
+        Object.entries(t.activeMatches).forEach(([key, m]) => {
+            if (m && typeof m === "object") activeMatches[key] = m;
+        });
+    }
+    // Older data had a single tournament.activeMatch. It's intentionally
+    // dropped here: that one slot never belonged to any specific scorer, and
+    // keeping it around would show as an un-ownable ghost on the Live tab.
+    return {
+        id: t.id || uid(),
+        name: t.name || "Tournament",
+        date: t.date || todayISO(),
+        teams: Array.isArray(t.teams) ? t.teams.map(team => ({
+            id: team.id || uid(),
+            name: team.name || "Team",
+            // v1 used playerIds (roster refs); v2+ uses free-text players.
+            players: Array.isArray(team.players) ? team.players.filter(p => typeof p === "string") : [],
+        })) : [],
+        matches: Array.isArray(t.matches) ? t.matches : [],
+        activeMatches,
+        endedAt: t.endedAt || null,
+        createdAt: t.createdAt || new Date().toISOString(),
+        matchDurationMin: Number.isFinite(t.matchDurationMin) && t.matchDurationMin > 0
+            ? t.matchDurationMin
+            : DEFAULT_MATCH_MIN,
+        timeoutDurationMin: Number.isFinite(t.timeoutDurationMin) && t.timeoutDurationMin > 0
+            ? t.timeoutDurationMin
+            : DEFAULT_TIMEOUT_MIN,
+    };
+};
 
 const teamBreakdown = (team) => {
     const counts = { 1: 0, 2: 0, 3: 0 };
@@ -468,7 +535,7 @@ const playTimerAlarm = () => {
     }
 };
 
-function Scoreboard({ session, teams, onUpdate, onEndMatch, showToast, canEdit }) {
+function Scoreboard({ session, teams, onUpdate, onEndMatch, onSaveSession, showToast, canEdit, matchDurationMin, timeoutDurationMin }) {
     const teamLabels = teams.map((_, i) => String.fromCharCode(65 + i));
     const sb = session.scoreboard || {};
     // Default: first two teams play; clamp to valid indices.
@@ -479,31 +546,69 @@ function Scoreboard({ session, teams, onUpdate, onEndMatch, showToast, canEdit }
     if (teamIdxA === teamIdxB) teamIdxB = (teamIdxA + 1) % teams.length;
     const scoreA = sb.scoreA || 0;
     const scoreB = sb.scoreB || 0;
+    const timeoutsUsedA = sb.timeoutsUsedA || 0;
+    const timeoutsUsedB = sb.timeoutsUsedB || 0;
 
-    const [durationMin, setDurationMin] = useState(11);
-    const [elapsedSec, setElapsedSec] = useState(0);
-    const [running, setRunning] = useState(false);
-    const durationSec = Math.max(1, durationMin) * 60;
+    const [now, setNow] = useState(() => Date.now());
+    const alarmFiredRef = useRef(false);
+    const toAlarmFiredRef = useRef(false);
+
+    const running = !!sb.timerRunning;
+    const timeoutTeam = sb.timeoutTeam || null;
 
     useEffect(() => {
-        if (!running) return;
-        const id = setInterval(() => {
-            setElapsedSec(e => {
-                if (e + 1 >= durationSec) {
-                    setRunning(false);
-                    playTimerAlarm();
-                    return durationSec;
-                }
-                return e + 1;
-            });
-        }, 1000);
+        if (!running && !timeoutTeam) return;
+        setNow(Date.now());
+        const id = setInterval(() => setNow(Date.now()), 1000);
         return () => clearInterval(id);
-    }, [running, durationSec]);
+    }, [running, timeoutTeam]);
 
-    const remainingSec = Math.max(0, durationSec - elapsedSec);
+    const match = computeMatchTime(sb, matchDurationMin, now);
+    const timeoutT = computeTimeoutTime(sb, timeoutDurationMin, now);
+    const elapsedSec = match.elapsedSec;
+    const remainingSec = match.remainingSec;
     const mm = Math.floor(remainingSec / 60);
     const ss = remainingSec % 60;
-    const timeExpired = remainingSec === 0;
+    const timeExpired = match.expired;
+    const timerNotStarted = canEdit && !running && elapsedSec === 0 && !timeoutTeam;
+    const timerPaused = canEdit && !running && elapsedSec > 0 && !timeExpired && !timeoutTeam;
+    const toMM = Math.floor(timeoutT.remainingSec / 60);
+    const toSS = timeoutT.remainingSec % 60;
+
+    // Auto-pause the main timer when it hits 0 (owner writes, everyone plays alarm once).
+    useEffect(() => {
+        if (!running || !timeExpired) {
+            if (!running && elapsedSec === 0) alarmFiredRef.current = false;
+            return;
+        }
+        if (alarmFiredRef.current) return;
+        alarmFiredRef.current = true;
+        playTimerAlarm();
+        if (canEdit) {
+            onUpdate({
+                timerRunning: false,
+                timerStartAt: null,
+                timerAccumMs: match.durationSec * 1000,
+            });
+        }
+    }, [running, timeExpired, elapsedSec, canEdit]);
+
+    // Auto-end timeout + auto-resume main timer when timeout expires.
+    useEffect(() => {
+        if (!timeoutTeam) { toAlarmFiredRef.current = false; return; }
+        if (!timeoutT.expired) return;
+        if (toAlarmFiredRef.current) return;
+        toAlarmFiredRef.current = true;
+        playTimerAlarm();
+        if (canEdit) {
+            onUpdate({
+                timeoutTeam: null,
+                timeoutStartAt: null,
+                timerRunning: true,
+                timerStartAt: Date.now(),
+            });
+        }
+    }, [timeoutTeam, timeoutT.expired, canEdit]);
 
     const bump = (which, delta) => {
         if (!canEdit) return;
@@ -513,12 +618,18 @@ function Scoreboard({ session, teams, onUpdate, onEndMatch, showToast, canEdit }
 
     const pickTeam = (which, newIdx) => {
         if (!canEdit) return;
+        const reset = {
+            scoreA: 0, scoreB: 0,
+            timeoutsUsedA: 0, timeoutsUsedB: 0,
+            timerRunning: false, timerStartAt: null, timerAccumMs: 0,
+            timeoutTeam: null, timeoutStartAt: null,
+        };
         if (which === "A") {
             const nextB = newIdx === teamIdxB ? teamIdxA : teamIdxB;
-            onUpdate({ teamIdxA: newIdx, teamIdxB: nextB, scoreA: 0, scoreB: 0 });
+            onUpdate({ teamIdxA: newIdx, teamIdxB: nextB, ...reset });
         } else {
             const nextA = newIdx === teamIdxA ? teamIdxB : teamIdxA;
-            onUpdate({ teamIdxA: nextA, teamIdxB: newIdx, scoreA: 0, scoreB: 0 });
+            onUpdate({ teamIdxA: nextA, teamIdxB: newIdx, ...reset });
         }
     };
 
@@ -528,9 +639,74 @@ function Scoreboard({ session, teams, onUpdate, onEndMatch, showToast, canEdit }
         onUpdate({ scoreA: 0, scoreB: 0, teamIdxA, teamIdxB });
     };
 
+    const toggleTimer = () => {
+        if (!canEdit) return;
+        if (running) {
+            onUpdate({
+                timerRunning: false,
+                timerStartAt: null,
+                timerAccumMs: match.elapsedMs,
+            });
+        } else {
+            onUpdate({
+                timerRunning: true,
+                timerStartAt: Date.now(),
+            });
+        }
+    };
+
     const resetTimer = () => {
-        setElapsedSec(0);
-        setRunning(false);
+        if (!canEdit) return;
+        if (elapsedSec > 0 || timeoutTeam) {
+            if (!confirm("Reset the match timer back to 0? Any active timeout will also be cleared.")) return;
+        }
+        alarmFiredRef.current = false;
+        toAlarmFiredRef.current = false;
+        onUpdate({
+            timerRunning: false,
+            timerStartAt: null,
+            timerAccumMs: 0,
+            timeoutTeam: null,
+            timeoutStartAt: null,
+        });
+    };
+
+    const callTimeout = (which) => {
+        if (!canEdit) return;
+        if (timeoutTeam) return;
+        const used = which === "A" ? timeoutsUsedA : timeoutsUsedB;
+        if (used >= TIMEOUTS_PER_TEAM) return;
+        onUpdate({
+            timerRunning: false,
+            timerStartAt: null,
+            timerAccumMs: match.elapsedMs,
+            timeoutTeam: which,
+            timeoutStartAt: Date.now(),
+            [which === "A" ? "timeoutsUsedA" : "timeoutsUsedB"]: used + 1,
+        });
+    };
+
+    const endTimeout = () => {
+        if (!canEdit) return;
+        onUpdate({
+            timeoutTeam: null,
+            timeoutStartAt: null,
+            timerRunning: true,
+            timerStartAt: Date.now(),
+        });
+    };
+
+    // Dismiss the active timeout WITHOUT auto-resuming the match timer.
+    // Escape hatch when a timeout was called in error or needs to end without
+    // play restarting immediately.
+    const stopTimeout = () => {
+        if (!canEdit) return;
+        if (!timeoutTeam) return;
+        toAlarmFiredRef.current = false;
+        onUpdate({
+            timeoutTeam: null,
+            timeoutStartAt: null,
+        });
     };
 
     const endMatch = () => {
@@ -547,64 +723,116 @@ function Scoreboard({ session, teams, onUpdate, onEndMatch, showToast, canEdit }
             durationSec: elapsedSec,
             endedAt: new Date().toISOString(),
         });
-        setElapsedSec(0);
-        setRunning(false);
+        alarmFiredRef.current = false;
+        toAlarmFiredRef.current = false;
         showToast?.("Match recorded");
     };
 
-    const renderScoreTile = (which, idx, score) => (
-        <div key={which} className={`scoreboard-team team-${idx + 1}`}>
-            {teams.length > 2 ? (
-                <select
-                    className="scoreboard-team-picker"
-                    value={idx}
-                    onChange={e => pickTeam(which, Number(e.target.value))}
-                    disabled={!canEdit}
-                >
-                    {teams.map((_, i) => (
-                        <option key={i} value={i}>Team {teamLabels[i]}</option>
-                    ))}
-                </select>
-            ) : (
-                <div className="jersey">{teamLabels[idx]}</div>
-            )}
-            <div className="score-value">{score}</div>
-            <div className="score-controls">
-                <button className="btn btn-secondary" onClick={() => bump(which, -1)} disabled={!canEdit} aria-label={`Team ${teamLabels[idx]} minus one`}>−</button>
-                <button className="btn" onClick={() => bump(which, +1)} disabled={!canEdit} aria-label={`Team ${teamLabels[idx]} plus one`}>+</button>
+    // Weekly uses fixed team colors A/B/C.
+    const weeklyTeamColor = (idx) => ["#FF4D6D", "#00F0FF", "#FFC107"][idx % 3];
+    const timeoutColor = timeoutTeam
+        ? weeklyTeamColor(timeoutTeam === "A" ? teamIdxA : teamIdxB)
+        : null;
+
+    const renderScoreTile = (which, idx, score) => {
+        const used = which === "A" ? timeoutsUsedA : timeoutsUsedB;
+        const remaining = Math.max(0, TIMEOUTS_PER_TEAM - used);
+        return (
+            <div key={which} className={`scoreboard-team team-${idx + 1}`}>
+                {teams.length > 2 ? (
+                    <select
+                        className="scoreboard-team-picker"
+                        value={idx}
+                        onChange={e => pickTeam(which, Number(e.target.value))}
+                        disabled={!canEdit}
+                    >
+                        {teams.map((_, i) => (
+                            <option key={i} value={i}>Team {teamLabels[i]}</option>
+                        ))}
+                    </select>
+                ) : (
+                    <div className="jersey">{teamLabels[idx]}</div>
+                )}
+                <div className="score-value">{score}</div>
+                <div className="score-controls">
+                    <button className="btn btn-secondary" onClick={() => bump(which, -1)} disabled={!canEdit} aria-label={`Team ${teamLabels[idx]} minus one`}>−</button>
+                    <button className="btn" onClick={() => bump(which, +1)} disabled={!canEdit} aria-label={`Team ${teamLabels[idx]} plus one`}>+</button>
+                </div>
+                {canEdit && (
+                    <div className="timeout-row">
+                        <div className="timeout-dots" aria-label={`${remaining} of ${TIMEOUTS_PER_TEAM} timeouts remaining`}>
+                            {Array.from({ length: TIMEOUTS_PER_TEAM }).map((_, i) => (
+                                <span key={i} className={`timeout-dot${i < used ? " used" : ""}`}></span>
+                            ))}
+                        </div>
+                        <button
+                            className="btn btn-secondary timeout-btn"
+                            onClick={() => callTimeout(which)}
+                            disabled={remaining === 0 || !!timeoutTeam || timeExpired}
+                            title={remaining === 0 ? "No timeouts left" : `Call timeout (${remaining} left)`}
+                        >
+                            ⏱ Timeout
+                        </button>
+                    </div>
+                )}
             </div>
-        </div>
-    );
+        );
+    };
 
     return (
         <div className="card">
             <h2>Scoreboard</h2>
+            {timeoutTeam && (
+                <div
+                    className="timeout-banner"
+                    style={{
+                        borderColor: timeoutColor,
+                        background: `${timeoutColor}1a`,
+                    }}
+                >
+                    <div className="timeout-banner-head">
+                        <span className="timeout-banner-label" style={{ color: timeoutColor }}>
+                            ⏱ Timeout · Team {teamLabels[timeoutTeam === "A" ? teamIdxA : teamIdxB]}
+                        </span>
+                        <span className="timeout-banner-time" style={{ color: timeoutColor }}>
+                            {toMM}:{toSS.toString().padStart(2, "0")}
+                        </span>
+                    </div>
+                    <div className="timeout-banner-actions">
+                        <button className="btn btn-secondary" onClick={stopTimeout} title="End timeout without restarting the match timer">Stop</button>
+                        <button className="btn" onClick={endTimeout}>End timeout &amp; resume</button>
+                    </div>
+                </div>
+            )}
+            {!timeoutTeam && (timerNotStarted || timerPaused) && (
+                <div className="timer-reminder">
+                    <span className="timer-reminder-icon">⏱</span>
+                    <span className="timer-reminder-text">
+                        {timerNotStarted
+                            ? "Don't forget to start the timer when the match begins."
+                            : "Timer is paused — resume it to keep tracking the match."}
+                    </span>
+                </div>
+            )}
             <div className={`scoreboard-timer${timeExpired ? " expired" : ""}`}>
                 <div className="timer-display">
                     {mm}:{ss.toString().padStart(2, "0")}
                 </div>
-                <div className="timer-controls">
-                    <button
-                        className="btn"
-                        onClick={() => setRunning(r => !r)}
-                        disabled={timeExpired && !running}
-                    >
-                        {running ? "Pause" : (elapsedSec > 0 ? "Resume" : "Start")}
-                    </button>
-                    <button className="btn btn-secondary" onClick={resetTimer}>Reset</button>
-                    <label className="duration-input">
-                        <span>Length</span>
-                        <input
-                            type="number"
-                            min="1"
-                            max="99"
-                            value={durationMin}
-                            onChange={e => setDurationMin(Math.max(1, Number(e.target.value) || 1))}
-                            disabled={running}
-                        />
-                        <span>min</span>
-                    </label>
-                </div>
+                {canEdit && (
+                    <div className="timer-controls">
+                        <button
+                            className="btn"
+                            onClick={toggleTimer}
+                            disabled={(timeExpired && !running) || !!timeoutTeam}
+                        >
+                            {running ? "Pause" : (elapsedSec > 0 ? "Resume" : "Start")}
+                        </button>
+                        <button className="btn btn-secondary" onClick={resetTimer}>Reset</button>
+                        <span className="duration-static">
+                            {matchDurationMin || DEFAULT_MATCH_MIN} min match
+                        </span>
+                    </div>
+                )}
             </div>
             <div className="scoreboard-teams scoreboard-2team">
                 {renderScoreTile("A", teamIdxA, scoreA)}
@@ -613,8 +841,11 @@ function Scoreboard({ session, teams, onUpdate, onEndMatch, showToast, canEdit }
             </div>
             {canEdit && (
                 <div className="btn-row">
-                    <button className="btn btn-secondary" onClick={resetScores}>Reset Scores</button>
+                    <button className="btn btn-danger" onClick={resetScores}>Reset Scores</button>
                     <button className="btn" onClick={endMatch}>End Match</button>
+                    {onSaveSession && (
+                        <button className="btn btn-danger save-session-btn" onClick={onSaveSession}>Save Session</button>
+                    )}
                 </div>
             )}
             {Array.isArray(session.matches) && session.matches.length > 0 && (
@@ -636,10 +867,14 @@ function ThisWeekView({ members, currentSession, setCurrentSession, saveSession,
     const [filter, setFilter] = useState("all");
     const [selectedPlayer, setSelectedPlayer] = useState(null); // { playerId, fromTeamIdx }
     const [dragOverTeam, setDragOverTeam] = useState(null);
+    const [newMatchMin, setNewMatchMin] = useState(DEFAULT_MATCH_MIN);
+    const [newTimeoutMin, setNewTimeoutMin] = useState(DEFAULT_TIMEOUT_MIN);
+    const locked = !!currentSession?.teamsFinalized;
 
     // Move a player and insert at an exact position. If toIdx is null, append.
     // Correctly handles same-team moves (index shift after removal).
     const movePlayerTo = (playerId, fromTeamIdx, toTeamIdx, toIdx) => {
+        if (locked) return;
         if (!currentSession?.teams) return;
         const teams = currentSession.teams.map(t => [...t]);
         const srcIdx = teams[fromTeamIdx].indexOf(playerId);
@@ -659,6 +894,7 @@ function ThisWeekView({ members, currentSession, setCurrentSession, saveSession,
 
     // Swap two players (works across teams or within the same team).
     const swapPlayers = (p1, t1, p2, t2) => {
+        if (locked) return;
         if (!currentSession?.teams) return;
         const teams = currentSession.teams.map(t => [...t]);
         const i1 = teams[t1].indexOf(p1);
@@ -671,6 +907,7 @@ function ThisWeekView({ members, currentSession, setCurrentSession, saveSession,
     };
 
     const handlePlayerTap = (playerId, teamIdx) => {
+        if (locked) return;
         if (selectedPlayer?.playerId === playerId) {
             setSelectedPlayer(null);
         } else if (selectedPlayer) {
@@ -681,6 +918,7 @@ function ThisWeekView({ members, currentSession, setCurrentSession, saveSession,
     };
 
     const handleTeamTap = (teamIdx) => {
+        if (locked) return;
         if (selectedPlayer) movePlayerTo(selectedPlayer.playerId, selectedPlayer.fromTeamIdx, teamIdx, null);
     };
 
@@ -694,12 +932,23 @@ function ThisWeekView({ members, currentSession, setCurrentSession, saveSession,
             date,
             available: members.map(m => m.id),
             teams: null,
-            locked: false
+            locked: false,
+            matchDurationMin: Math.max(1, Number(newMatchMin) || DEFAULT_MATCH_MIN),
+            timeoutDurationMin: Math.max(1, Number(newTimeoutMin) || DEFAULT_TIMEOUT_MIN),
         });
     };
 
+    const setMatchDuration = (val) => {
+        if (locked) return;
+        setCurrentSession({ ...currentSession, matchDurationMin: Math.max(1, Number(val) || DEFAULT_MATCH_MIN) });
+    };
+    const setTimeoutDuration = (val) => {
+        if (locked) return;
+        setCurrentSession({ ...currentSession, timeoutDurationMin: Math.max(1, Number(val) || DEFAULT_TIMEOUT_MIN) });
+    };
+
     const toggleOut = (memberId) => {
-        if (!currentSession || currentSession.locked) return;
+        if (!currentSession || currentSession.locked || locked) return;
         const available = currentSession.available.includes(memberId)
             ? currentSession.available.filter(id => id !== memberId)
             : [...currentSession.available, memberId];
@@ -707,9 +956,11 @@ function ThisWeekView({ members, currentSession, setCurrentSession, saveSession,
     };
 
     const markAllIn = () => {
+        if (locked) return;
         setCurrentSession({ ...currentSession, available: members.map(m => m.id), teams: null });
     };
     const markAllOut = () => {
+        if (locked) return;
         setCurrentSession({ ...currentSession, available: [], teams: null });
     };
 
@@ -718,13 +969,26 @@ function ThisWeekView({ members, currentSession, setCurrentSession, saveSession,
         const availablePlayers = members.filter(m => currentSession.available.includes(m.id));
         const numTeams = availablePlayers.length >= 17 ? 3 : 2;
         const teams = generateBalancedTeams(availablePlayers, numTeams).map(team => team.map(p => p.id));
-        setCurrentSession({ ...currentSession, teams });
+        setCurrentSession({ ...currentSession, teams, teamsFinalized: false });
         setSelectedPlayer(null);
         showToast(`${numTeams} teams generated`);
     };
 
+    const finalizeTeams = () => {
+        if (!currentSession?.teams) return;
+        setCurrentSession({ ...currentSession, teamsFinalized: true });
+        showToast("Match is live");
+    };
+
+    const editTeams = () => {
+        if (!currentSession?.teamsFinalized) return;
+        if (!confirm("Edit teams? The match will stop being live until you finalize again.")) return;
+        setCurrentSession({ ...currentSession, teamsFinalized: false });
+    };
+
     const lockAndSave = () => {
         if (!currentSession?.teams) return;
+        if (!confirm("Save and end this session? Scoring will stop and the session will be archived.")) return;
         saveSession({ ...currentSession, locked: true });
         setCurrentSession(null);
         showToast("Session saved");
@@ -752,6 +1016,27 @@ function ThisWeekView({ members, currentSession, setCurrentSession, saveSession,
                 <div className="row" style={{ marginBottom: "1rem" }}>
                     <input type="date" value={date} onChange={e => setDate(e.target.value)} />
                 </div>
+                <div className="duration-grid">
+                    <label className="duration-field">
+                        <span>Match length</span>
+                        <input type="number" min="1" max="99"
+                            value={newMatchMin}
+                            onChange={e => setNewMatchMin(Math.max(1, Number(e.target.value) || DEFAULT_MATCH_MIN))}
+                        />
+                        <span className="duration-unit">min</span>
+                    </label>
+                    <label className="duration-field">
+                        <span>Timeout length</span>
+                        <input type="number" min="1" max="10"
+                            value={newTimeoutMin}
+                            onChange={e => setNewTimeoutMin(Math.max(1, Number(e.target.value) || DEFAULT_TIMEOUT_MIN))}
+                        />
+                        <span className="duration-unit">min</span>
+                    </label>
+                    <p className="help-text duration-help">
+                        Each team gets {TIMEOUTS_PER_TEAM} timeouts per match. These values can't be changed once the match goes live.
+                    </p>
+                </div>
                 <button className="btn" onClick={startSession} disabled={members.length === 0}>
                     {members.length === 0 ? "Add members first" : "Start Session"}
                 </button>
@@ -772,7 +1057,7 @@ function ThisWeekView({ members, currentSession, setCurrentSession, saveSession,
 
     return (
         <div>
-            <div className="card">
+            <div className={`card${locked ? " card-locked" : ""}`}>
                 <h2>{formatDate(currentSession.date)}</h2>
                 <div className="stats-bar">
                     <div className="stat">
@@ -833,7 +1118,8 @@ function ThisWeekView({ members, currentSession, setCurrentSession, saveSession,
                     <button
                         className="btn"
                         onClick={generateTeams}
-                        disabled={currentSession.available.length < 3}
+                        disabled={currentSession.available.length < 3 || locked}
+                        title={locked ? "Finalized — tap Edit Teams first" : ""}
                     >
                         {currentSession.teams ? "Reshuffle Teams" : "Generate Teams"}
                     </button>
@@ -844,12 +1130,15 @@ function ThisWeekView({ members, currentSession, setCurrentSession, saveSession,
                 {currentSession.available.length < 3 && (
                     <p className="help-text">Need at least 3 players to form teams.</p>
                 )}
+                {locked && (
+                    <p className="help-text">Teams are locked while the match is live. Tap <strong>Edit Teams</strong> to make changes.</p>
+                )}
             </div>
 
             {currentSession.teams && (
                 <div className="card">
-                    <h2>Teams</h2>
-                    {selectedPlayer && (() => {
+                    <h2>Teams{locked && <span className="locked-badge" title="Teams are finalized">🔒 LIVE</span>}</h2>
+                    {!locked && selectedPlayer && (() => {
                         const p = members.find(m => m.id === selectedPlayer.playerId);
                         return (
                             <div className="move-hint">
@@ -860,25 +1149,28 @@ function ThisWeekView({ members, currentSession, setCurrentSession, saveSession,
                     <div className="teams-grid">
                         {currentSession.teams.map((teamIds, i) => {
                             const team = teamIds.map(id => members.find(m => m.id === id)).filter(Boolean);
-                            const droppable = selectedPlayer != null && selectedPlayer.fromTeamIdx !== i;
-                            const dragOver = dragOverTeam === i;
+                            const droppable = !locked && selectedPlayer != null && selectedPlayer.fromTeamIdx !== i;
+                            const dragOver = !locked && dragOverTeam === i;
+                            const teamHandlers = locked ? {} : {
+                                onClick: () => handleTeamTap(i),
+                                onDragOver: e => { e.preventDefault(); e.dataTransfer.dropEffect = "move"; if (dragOverTeam !== i) setDragOverTeam(i); },
+                                onDragLeave: e => {
+                                    if (!e.currentTarget.contains(e.relatedTarget)) setDragOverTeam(null);
+                                },
+                                onDrop: e => {
+                                    e.preventDefault();
+                                    setDragOverTeam(null);
+                                    try {
+                                        const data = JSON.parse(e.dataTransfer.getData("application/json"));
+                                        movePlayerTo(data.playerId, data.fromTeamIdx, i, null);
+                                    } catch {}
+                                },
+                            };
                             return (
                                 <div
                                     key={i}
-                                    className={`team team-${i + 1} ${droppable ? "droppable" : ""} ${dragOver ? "drag-over" : ""}`}
-                                    onClick={() => handleTeamTap(i)}
-                                    onDragOver={e => { e.preventDefault(); e.dataTransfer.dropEffect = "move"; if (dragOverTeam !== i) setDragOverTeam(i); }}
-                                    onDragLeave={e => {
-                                        if (!e.currentTarget.contains(e.relatedTarget)) setDragOverTeam(null);
-                                    }}
-                                    onDrop={e => {
-                                        e.preventDefault();
-                                        setDragOverTeam(null);
-                                        try {
-                                            const data = JSON.parse(e.dataTransfer.getData("application/json"));
-                                            movePlayerTo(data.playerId, data.fromTeamIdx, i, null);
-                                        } catch {}
-                                    }}
+                                    className={`team team-${i + 1} ${droppable ? "droppable" : ""} ${dragOver ? "drag-over" : ""} ${locked ? "locked" : ""}`}
+                                    {...teamHandlers}
                                 >
                                     <div className="team-header">
                                         <div className="jersey">{String.fromCharCode(65 + i)}</div>
@@ -888,22 +1180,21 @@ function ThisWeekView({ members, currentSession, setCurrentSession, saveSession,
                                         </div>
                                     </div>
                                     <div className="team-players">
-                                        {team.map((p, playerIdx) => (
-                                            <div
-                                                key={p.id}
-                                                className={`team-player ${selectedPlayer?.playerId === p.id ? "selected" : ""}`}
-                                                draggable
-                                                onDragStart={e => {
+                                        {team.map((p, playerIdx) => {
+                                            const playerHandlers = locked ? {
+                                                onClick: e => e.stopPropagation(),
+                                            } : {
+                                                onDragStart: e => {
                                                     e.dataTransfer.setData("application/json", JSON.stringify({ playerId: p.id, fromTeamIdx: i }));
                                                     e.dataTransfer.effectAllowed = "move";
                                                     e.currentTarget.classList.add("dragging");
-                                                }}
-                                                onDragEnd={e => {
+                                                },
+                                                onDragEnd: e => {
                                                     e.currentTarget.classList.remove("dragging");
                                                     e.currentTarget.classList.remove("drop-before", "drop-after");
                                                     setDragOverTeam(null);
-                                                }}
-                                                onDragOver={e => {
+                                                },
+                                                onDragOver: e => {
                                                     e.preventDefault();
                                                     e.stopPropagation();
                                                     e.dataTransfer.dropEffect = "move";
@@ -912,11 +1203,11 @@ function ThisWeekView({ members, currentSession, setCurrentSession, saveSession,
                                                     e.currentTarget.classList.toggle("drop-before", !after);
                                                     e.currentTarget.classList.toggle("drop-after", after);
                                                     if (dragOverTeam !== i) setDragOverTeam(i);
-                                                }}
-                                                onDragLeave={e => {
+                                                },
+                                                onDragLeave: e => {
                                                     e.currentTarget.classList.remove("drop-before", "drop-after");
-                                                }}
-                                                onDrop={e => {
+                                                },
+                                                onDrop: e => {
                                                     e.preventDefault();
                                                     e.stopPropagation();
                                                     const rect = e.currentTarget.getBoundingClientRect();
@@ -927,32 +1218,78 @@ function ThisWeekView({ members, currentSession, setCurrentSession, saveSession,
                                                         const data = JSON.parse(e.dataTransfer.getData("application/json"));
                                                         movePlayerTo(data.playerId, data.fromTeamIdx, i, playerIdx + (after ? 1 : 0));
                                                     } catch {}
-                                                }}
-                                                onClick={e => { e.stopPropagation(); handlePlayerTap(p.id, i); }}
-                                            >
-                                                <span>{p.name}</span>
-                                            </div>
-                                        ))}
+                                                },
+                                                onClick: e => { e.stopPropagation(); handlePlayerTap(p.id, i); },
+                                            };
+                                            return (
+                                                <div
+                                                    key={p.id}
+                                                    className={`team-player ${selectedPlayer?.playerId === p.id ? "selected" : ""}`}
+                                                    draggable={!locked}
+                                                    style={locked ? { cursor: "default" } : undefined}
+                                                    {...playerHandlers}
+                                                >
+                                                    <span>{p.name}</span>
+                                                </div>
+                                            );
+                                        })}
                                     </div>
                                 </div>
                             );
                         })}
                     </div>
-                    <p className="help-text">
-                        Drag a player onto another player to place them at that exact spot (works within the same team too). Drop on empty team space to add to the end. On mobile: tap a player, then tap another player to swap, or tap a team card to move to its end.
-                    </p>
+                    {!locked && (
+                        <p className="help-text">
+                            Drag a player onto another player to place them at that exact spot (works within the same team too). Drop on empty team space to add to the end. On mobile: tap a player, then tap another player to swap, or tap a team card to move to its end.
+                        </p>
+                    )}
+                    <div className="duration-grid pre-match-settings">
+                        <label className="duration-field">
+                            <span>Match length</span>
+                            <input type="number" min="1" max="99"
+                                value={currentSession.matchDurationMin || DEFAULT_MATCH_MIN}
+                                onChange={e => setMatchDuration(e.target.value)}
+                                disabled={locked}
+                            />
+                            <span className="duration-unit">min</span>
+                        </label>
+                        <label className="duration-field">
+                            <span>Timeout length</span>
+                            <input type="number" min="1" max="10"
+                                value={currentSession.timeoutDurationMin || DEFAULT_TIMEOUT_MIN}
+                                onChange={e => setTimeoutDuration(e.target.value)}
+                                disabled={locked}
+                            />
+                            <span className="duration-unit">min</span>
+                        </label>
+                        <p className="help-text duration-help">
+                            {TIMEOUTS_PER_TEAM} timeouts per team per match.
+                            {locked ? " Locked while the match is live." : " Lock in before you finalize."}
+                        </p>
+                    </div>
                     <div className="btn-row">
                         <button className="btn" onClick={copyTeamsText}>Copy for WhatsApp</button>
-                        <button className="btn btn-secondary" onClick={lockAndSave}>Save Session</button>
+                        {!currentSession.teamsFinalized ? (
+                            <button className="btn" onClick={finalizeTeams}>Finalize Teams · Go Live</button>
+                        ) : (
+                            <button className="btn btn-secondary" onClick={editTeams}>Edit Teams</button>
+                        )}
                     </div>
+                    {!currentSession.teamsFinalized && (
+                        <p className="help-text">
+                            Teams are a draft. Finalize to start the match and make it visible on the <strong>Live</strong> tab.
+                        </p>
+                    )}
                 </div>
             )}
 
-            {currentSession.teams && (
+            {currentSession.teams && currentSession.teamsFinalized && (
                 <Scoreboard
                     session={currentSession}
                     teams={currentSession.teams}
                     canEdit={true}
+                    matchDurationMin={currentSession.matchDurationMin || DEFAULT_MATCH_MIN}
+                    timeoutDurationMin={currentSession.timeoutDurationMin || DEFAULT_TIMEOUT_MIN}
                     onUpdate={(patch) => setCurrentSession({
                         ...currentSession,
                         scoreboard: { ...(currentSession.scoreboard || {}), ...patch },
@@ -964,8 +1301,16 @@ function ThisWeekView({ members, currentSession, setCurrentSession, saveSession,
                             ...(currentSession.scoreboard || {}),
                             scoreA: 0,
                             scoreB: 0,
+                            timeoutsUsedA: 0,
+                            timeoutsUsedB: 0,
+                            timerRunning: false,
+                            timerStartAt: null,
+                            timerAccumMs: 0,
+                            timeoutTeam: null,
+                            timeoutStartAt: null,
                         },
                     })}
+                    onSaveSession={lockAndSave}
                     showToast={showToast}
                 />
             )}
@@ -1060,11 +1405,23 @@ function MatchView({ activeRoster, patchActive, showToast }) {
         );
     }
 
+    if (!currentSession.teamsFinalized) {
+        return (
+            <div className="card">
+                <div className="empty">
+                    Teams aren't finalized yet. Scoring will open once the admin finalizes them.
+                </div>
+            </div>
+        );
+    }
+
     return (
         <Scoreboard
             session={currentSession}
             teams={teams}
             canEdit={true}
+            matchDurationMin={currentSession.matchDurationMin || DEFAULT_MATCH_MIN}
+            timeoutDurationMin={currentSession.timeoutDurationMin || DEFAULT_TIMEOUT_MIN}
             showToast={showToast}
             onUpdate={(patch) => patchActive(r => ({
                 ...r,
@@ -1082,6 +1439,13 @@ function MatchView({ activeRoster, patchActive, showToast }) {
                         ...(r.currentSession?.scoreboard || {}),
                         scoreA: 0,
                         scoreB: 0,
+                        timeoutsUsedA: 0,
+                        timeoutsUsedB: 0,
+                        timerRunning: false,
+                        timerStartAt: null,
+                        timerAccumMs: 0,
+                        timeoutTeam: null,
+                        timeoutStartAt: null,
                     },
                 },
             }))}
@@ -1474,7 +1838,7 @@ function TeamsManagerCard({ tournament, patchTournament, disabled, showToast }) 
     );
 }
 
-function TournamentScoreboard({ tournament, patchTournament, showToast }) {
+function TournamentScoreboard({ tournament, patchTournament, showToast, scorerKey }) {
     const teams = tournament.teams || [];
 
     if (teams.length < 2) {
@@ -1486,7 +1850,8 @@ function TournamentScoreboard({ tournament, patchTournament, showToast }) {
         );
     }
 
-    const am = tournament.activeMatch || {};
+    const slotKey = scorerKey || "default";
+    const am = (tournament.activeMatches && tournament.activeMatches[slotKey]) || {};
     let teamAId = am.teamAId;
     let teamBId = am.teamBId;
     if (!teams.find(t => t.id === teamAId)) teamAId = teams[0].id;
@@ -1495,44 +1860,87 @@ function TournamentScoreboard({ tournament, patchTournament, showToast }) {
     }
     const scoreA = am.scoreA || 0;
     const scoreB = am.scoreB || 0;
+    const timeoutsUsedA = am.timeoutsUsedA || 0;
+    const timeoutsUsedB = am.timeoutsUsedB || 0;
 
-    const [durationMin, setDurationMin] = useState(11);
-    const [elapsedSec, setElapsedSec] = useState(0);
-    const [running, setRunning] = useState(false);
-    const durationSec = Math.max(1, durationMin) * 60;
+    const matchDurationMin = tournament.matchDurationMin || DEFAULT_MATCH_MIN;
+    const timeoutDurationMin = tournament.timeoutDurationMin || DEFAULT_TIMEOUT_MIN;
+
+    const [now, setNow] = useState(() => Date.now());
+    const alarmFiredRef = useRef(false);
+    const toAlarmFiredRef = useRef(false);
+
+    const running = !!am.timerRunning;
+    const timeoutTeam = am.timeoutTeam || null;
 
     useEffect(() => {
-        if (!running) return;
-        const id = setInterval(() => {
-            setElapsedSec(e => {
-                if (e + 1 >= durationSec) {
-                    setRunning(false);
-                    playTimerAlarm();
-                    return durationSec;
-                }
-                return e + 1;
-            });
-        }, 1000);
+        if (!running && !timeoutTeam) return;
+        setNow(Date.now());
+        const id = setInterval(() => setNow(Date.now()), 1000);
         return () => clearInterval(id);
-    }, [running, durationSec]);
+    }, [running, timeoutTeam]);
 
-    const remaining = Math.max(0, durationSec - elapsedSec);
+    const match = computeMatchTime(am, matchDurationMin, now);
+    const timeoutT = computeTimeoutTime(am, timeoutDurationMin, now);
+    const elapsedSec = match.elapsedSec;
+    const remaining = match.remainingSec;
     const mm = Math.floor(remaining / 60);
     const ss = remaining % 60;
-    const expired = remaining === 0;
+    const expired = match.expired;
+    const timerNotStarted = !running && elapsedSec === 0 && !timeoutTeam;
+    const timerPaused = !running && elapsedSec > 0 && !expired && !timeoutTeam;
+    const toMM = Math.floor(timeoutT.remainingSec / 60);
+    const toSS = timeoutT.remainingSec % 60;
 
     const setActive = (patch) => patchTournament(t => ({
         ...t,
-        activeMatch: { ...(t.activeMatch || {}), ...patch },
+        activeMatches: {
+            ...(t.activeMatches || {}),
+            [slotKey]: { ...((t.activeMatches && t.activeMatches[slotKey]) || {}), ...patch },
+        },
     }));
 
+    useEffect(() => {
+        if (!running || !expired) {
+            if (!running && elapsedSec === 0) alarmFiredRef.current = false;
+            return;
+        }
+        if (alarmFiredRef.current) return;
+        alarmFiredRef.current = true;
+        playTimerAlarm();
+        setActive({
+            timerRunning: false,
+            timerStartAt: null,
+            timerAccumMs: match.durationSec * 1000,
+        });
+    }, [running, expired, elapsedSec]);
+
+    useEffect(() => {
+        if (!timeoutTeam) { toAlarmFiredRef.current = false; return; }
+        if (!timeoutT.expired) return;
+        if (toAlarmFiredRef.current) return;
+        toAlarmFiredRef.current = true;
+        playTimerAlarm();
+        setActive({
+            timeoutTeam: null,
+            timeoutStartAt: null,
+            timerRunning: true,
+            timerStartAt: Date.now(),
+        });
+    }, [timeoutTeam, timeoutT.expired]);
+
     const pickTeam = (which, newId) => {
+        const reset = {
+            scoreA: 0, scoreB: 0, timeoutsUsedA: 0, timeoutsUsedB: 0,
+            timerRunning: false, timerStartAt: null, timerAccumMs: 0,
+            timeoutTeam: null, timeoutStartAt: null,
+        };
         if (which === "A") {
             const nextB = newId === teamBId ? teamAId : teamBId;
-            setActive({ teamAId: newId, teamBId: nextB, scoreA: 0, scoreB: 0 });
+            setActive({ teamAId: newId, teamBId: nextB, ...reset });
         } else {
             const nextA = newId === teamAId ? teamBId : teamAId;
-            setActive({ teamAId: nextA, teamBId: newId, scoreA: 0, scoreB: 0 });
+            setActive({ teamAId: nextA, teamBId: newId, ...reset });
         }
     };
 
@@ -1546,7 +1954,70 @@ function TournamentScoreboard({ tournament, patchTournament, showToast }) {
         setActive({ scoreA: 0, scoreB: 0, teamAId, teamBId });
     };
 
-    const resetTimer = () => { setElapsedSec(0); setRunning(false); };
+    const toggleTimer = () => {
+        if (running) {
+            setActive({
+                timerRunning: false,
+                timerStartAt: null,
+                timerAccumMs: match.elapsedMs,
+            });
+        } else {
+            setActive({
+                timerRunning: true,
+                timerStartAt: Date.now(),
+            });
+        }
+    };
+
+    const resetTimer = () => {
+        if (elapsedSec > 0 || timeoutTeam) {
+            if (!confirm("Reset the match timer back to 0? Any active timeout will also be cleared.")) return;
+        }
+        alarmFiredRef.current = false;
+        toAlarmFiredRef.current = false;
+        setActive({
+            timerRunning: false,
+            timerStartAt: null,
+            timerAccumMs: 0,
+            timeoutTeam: null,
+            timeoutStartAt: null,
+        });
+    };
+
+    const stopTimeout = () => {
+        if (!timeoutTeam) return;
+        toAlarmFiredRef.current = false;
+        setActive({
+            timeoutTeam: null,
+            timeoutStartAt: null,
+        });
+    };
+
+    const callTimeout = (which) => {
+        if (timeoutTeam) return;
+        const used = which === "A" ? timeoutsUsedA : timeoutsUsedB;
+        if (used >= TIMEOUTS_PER_TEAM) return;
+        setActive({
+            timerRunning: false,
+            timerStartAt: null,
+            timerAccumMs: match.elapsedMs,
+            timeoutTeam: which,
+            timeoutStartAt: Date.now(),
+            [which === "A" ? "timeoutsUsedA" : "timeoutsUsedB"]: used + 1,
+        });
+    };
+
+    const endTimeout = () => {
+        setActive({
+            timeoutTeam: null,
+            timeoutStartAt: null,
+            timerRunning: true,
+            timerStartAt: Date.now(),
+        });
+    };
+
+    const timeoutIdx = timeoutTeam ? teams.findIndex(x => x.id === (timeoutTeam === "A" ? teamAId : teamBId)) : -1;
+    const timeoutColor = timeoutIdx >= 0 ? teamColor(timeoutIdx) : null;
 
     const endMatch = () => {
         if (scoreA === 0 && scoreB === 0) {
@@ -1554,25 +2025,100 @@ function TournamentScoreboard({ tournament, patchTournament, showToast }) {
         } else if (!confirm("End this match? Score will be saved to the tournament.")) {
             return;
         }
-        patchTournament(t => ({
-            ...t,
-            matches: [...(t.matches || []), {
-                id: uid(),
-                teamAId, teamBId,
-                scoreA, scoreB,
-                durationSec: elapsedSec,
-                endedAt: new Date().toISOString(),
-            }],
-            activeMatch: { ...(t.activeMatch || {}), teamAId, teamBId, scoreA: 0, scoreB: 0 },
-        }));
-        setElapsedSec(0);
-        setRunning(false);
+        patchTournament(t => {
+            const nextActive = { ...(t.activeMatches || {}) };
+            delete nextActive[slotKey];
+            return {
+                ...t,
+                matches: [...(t.matches || []), {
+                    id: uid(),
+                    teamAId, teamBId,
+                    scoreA, scoreB,
+                    durationSec: elapsedSec,
+                    endedAt: new Date().toISOString(),
+                }],
+                activeMatches: nextActive,
+            };
+        });
+        alarmFiredRef.current = false;
+        toAlarmFiredRef.current = false;
         showToast?.("Match recorded");
+    };
+
+    const renderTournamentTile = (which, teamId, score) => {
+        const idx = teams.findIndex(t => t.id === teamId);
+        const name = teams[idx]?.name || "Team";
+        const used = which === "A" ? timeoutsUsedA : timeoutsUsedB;
+        const remainingTO = Math.max(0, TIMEOUTS_PER_TEAM - used);
+        return (
+            <div className="scoreboard-team" style={{ "--team-color": teamColor(idx) }}>
+                <select
+                    className="scoreboard-team-picker"
+                    value={teamId}
+                    onChange={e => pickTeam(which, e.target.value)}
+                    disabled={!!timeoutTeam}
+                >
+                    {teams.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
+                </select>
+                <div className="score-value">{score}</div>
+                <div className="score-controls">
+                    <button className="btn btn-secondary" onClick={() => bump(which, -1)} aria-label={`${name} minus one`}>−</button>
+                    <button className="btn" onClick={() => bump(which, +1)} aria-label={`${name} plus one`}>+</button>
+                </div>
+                <div className="timeout-row">
+                    <div className="timeout-dots" aria-label={`${remainingTO} of ${TIMEOUTS_PER_TEAM} timeouts remaining`}>
+                        {Array.from({ length: TIMEOUTS_PER_TEAM }).map((_, i) => (
+                            <span key={i} className={`timeout-dot${i < used ? " used" : ""}`}></span>
+                        ))}
+                    </div>
+                    <button
+                        className="btn btn-secondary timeout-btn"
+                        onClick={() => callTimeout(which)}
+                        disabled={remainingTO === 0 || !!timeoutTeam || expired}
+                        title={remainingTO === 0 ? "No timeouts left" : `Call timeout (${remainingTO} left)`}
+                    >
+                        ⏱ Timeout
+                    </button>
+                </div>
+            </div>
+        );
     };
 
     return (
         <div className="card">
             <h2>Record Match</h2>
+            {timeoutTeam && (
+                <div
+                    className="timeout-banner"
+                    style={{
+                        borderColor: timeoutColor,
+                        background: timeoutColor ? `${timeoutColor}1a` : undefined,
+                    }}
+                >
+                    <div className="timeout-banner-head">
+                        <span className="timeout-banner-label" style={{ color: timeoutColor }}>
+                            ⏱ Timeout · {teams.find(t => t.id === (timeoutTeam === "A" ? teamAId : teamBId))?.name || "Team"}
+                        </span>
+                        <span className="timeout-banner-time" style={{ color: timeoutColor }}>
+                            {toMM}:{toSS.toString().padStart(2, "0")}
+                        </span>
+                    </div>
+                    <div className="timeout-banner-actions">
+                        <button className="btn btn-secondary" onClick={stopTimeout} title="End timeout without restarting the match timer">Stop</button>
+                        <button className="btn" onClick={endTimeout}>End timeout &amp; resume</button>
+                    </div>
+                </div>
+            )}
+            {!timeoutTeam && (timerNotStarted || timerPaused) && (
+                <div className="timer-reminder">
+                    <span className="timer-reminder-icon">⏱</span>
+                    <span className="timer-reminder-text">
+                        {timerNotStarted
+                            ? "Don't forget to start the timer when the match begins."
+                            : "Timer is paused — resume it to keep tracking the match."}
+                    </span>
+                </div>
+            )}
             <div className={`scoreboard-timer${expired ? " expired" : ""}`}>
                 <div className="timer-display">
                     {mm}:{ss.toString().padStart(2, "0")}
@@ -1580,65 +2126,22 @@ function TournamentScoreboard({ tournament, patchTournament, showToast }) {
                 <div className="timer-controls">
                     <button
                         className="btn"
-                        onClick={() => setRunning(r => !r)}
-                        disabled={expired && !running}
+                        onClick={toggleTimer}
+                        disabled={(expired && !running) || !!timeoutTeam}
                     >
                         {running ? "Pause" : (elapsedSec > 0 ? "Resume" : "Start")}
                     </button>
                     <button className="btn btn-secondary" onClick={resetTimer}>Reset</button>
-                    <label className="duration-input">
-                        <span>Length</span>
-                        <input
-                            type="number"
-                            min="1"
-                            max="99"
-                            value={durationMin}
-                            onChange={e => setDurationMin(Math.max(1, Number(e.target.value) || 1))}
-                            disabled={running}
-                        />
-                        <span>min</span>
-                    </label>
+                    <span className="duration-static">{matchDurationMin} min match</span>
                 </div>
             </div>
             <div className="scoreboard-teams scoreboard-2team">
-                <div
-                    className="scoreboard-team"
-                    style={{ "--team-color": teamColor(teams.findIndex(t => t.id === teamAId)) }}
-                >
-                    <select
-                        className="scoreboard-team-picker"
-                        value={teamAId}
-                        onChange={e => pickTeam("A", e.target.value)}
-                    >
-                        {teams.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
-                    </select>
-                    <div className="score-value">{scoreA}</div>
-                    <div className="score-controls">
-                        <button className="btn btn-secondary" onClick={() => bump("A", -1)} aria-label="Team A minus one">−</button>
-                        <button className="btn" onClick={() => bump("A", +1)} aria-label="Team A plus one">+</button>
-                    </div>
-                </div>
+                {renderTournamentTile("A", teamAId, scoreA)}
                 <div className="vs-label">VS</div>
-                <div
-                    className="scoreboard-team"
-                    style={{ "--team-color": teamColor(teams.findIndex(t => t.id === teamBId)) }}
-                >
-                    <select
-                        className="scoreboard-team-picker"
-                        value={teamBId}
-                        onChange={e => pickTeam("B", e.target.value)}
-                    >
-                        {teams.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
-                    </select>
-                    <div className="score-value">{scoreB}</div>
-                    <div className="score-controls">
-                        <button className="btn btn-secondary" onClick={() => bump("B", -1)} aria-label="Team B minus one">−</button>
-                        <button className="btn" onClick={() => bump("B", +1)} aria-label="Team B plus one">+</button>
-                    </div>
-                </div>
+                {renderTournamentTile("B", teamBId, scoreB)}
             </div>
             <div className="btn-row">
-                <button className="btn btn-secondary" onClick={resetScores}>Reset Scores</button>
+                <button className="btn btn-danger" onClick={resetScores}>Reset Scores</button>
                 <button className="btn" onClick={endMatch}>End Match</button>
             </div>
         </div>
@@ -1820,26 +2323,19 @@ function TournamentMatchCard({ match, teams, index, canDelete, onDelete }) {
     );
 }
 
-function TournamentView({ activeRoster, patchActive, showToast, canManage, canScore }) {
-    const tournaments = activeRoster?.tournaments || [];
-    const [selectedId, setSelectedId] = useState(() => tournaments[tournaments.length - 1]?.id || null);
+function TournamentView({ tournaments, setTournaments, showToast, canManage, canScore, tournamentTab, setTournamentTab, selectedTournamentId, setSelectedTournamentId, scorerKey }) {
+    const selectedId = selectedTournamentId && tournaments.some(t => t.id === selectedTournamentId)
+        ? selectedTournamentId
+        : (tournaments[tournaments.length - 1]?.id || null);
+    const setSelectedId = (id) => setSelectedTournamentId(id);
 
     const activeTournament = tournaments.find(t => t.id === selectedId)
         || tournaments[tournaments.length - 1]
         || null;
 
-    useEffect(() => {
-        if (selectedId && !tournaments.some(t => t.id === selectedId)) {
-            setSelectedId(tournaments[tournaments.length - 1]?.id || null);
-        }
-    }, [tournaments.length, selectedId]);
-
     const patchTournament = (updater) => {
         if (!activeTournament) return;
-        patchActive(r => ({
-            ...r,
-            tournaments: (r.tournaments || []).map(t => t.id === activeTournament.id ? updater(t) : t),
-        }));
+        setTournaments(prev => prev.map(t => t.id === activeTournament.id ? updater(t) : t));
     };
 
     const createTournament = () => {
@@ -1850,7 +2346,7 @@ function TournamentView({ activeRoster, patchActive, showToast, canManage, canSc
             return;
         }
         const t = makeTournament(name);
-        patchActive(r => ({ ...r, tournaments: [...(r.tournaments || []), t] }));
+        setTournaments(prev => [...prev, t]);
         setSelectedId(t.id);
         showToast?.(`Tournament "${name}" created`);
     };
@@ -1869,14 +2365,19 @@ function TournamentView({ activeRoster, patchActive, showToast, canManage, canSc
     const deleteTournament = () => {
         if (!activeTournament) return;
         if (!confirm(`Delete tournament "${activeTournament.name}"? This can't be undone.`)) return;
-        patchActive(r => ({
-            ...r,
-            tournaments: (r.tournaments || []).filter(t => t.id !== activeTournament.id),
-        }));
+        setTournaments(prev => prev.filter(t => t.id !== activeTournament.id));
         showToast?.("Tournament deleted");
     };
 
     const setDate = (newDate) => patchTournament(t => ({ ...t, date: newDate }));
+    const setMatchMin = (val) => patchTournament(t => ({
+        ...t,
+        matchDurationMin: Math.max(1, Number(val) || DEFAULT_MATCH_MIN),
+    }));
+    const setTimeoutMin = (val) => patchTournament(t => ({
+        ...t,
+        timeoutDurationMin: Math.max(1, Number(val) || DEFAULT_TIMEOUT_MIN),
+    }));
 
     const endTournament = () => {
         if (!activeTournament) return;
@@ -1920,13 +2421,28 @@ function TournamentView({ activeRoster, patchActive, showToast, canManage, canSc
     const ended = !!activeTournament.endedAt;
     const champion = ended && standings[0] && standings[0].played > 0 ? standings[0].team : null;
 
+    const championIdx = champion ? teams.findIndex(t => t.id === champion.id) : -1;
+    const championColor = championIdx >= 0 ? teamColor(championIdx) : null;
+
+    const otherTournaments = tournaments.filter(t => t.id !== activeTournament.id);
+    const canRecord = !ended && (canManage || canScore);
+    const tabs = [
+        { key: "standings", label: "Standings" },
+        { key: "teams", label: "Teams" },
+        { key: "fixtures", label: "Fixtures" },
+        ...(canRecord ? [{ key: "score", label: "Score" }] : []),
+        { key: "matches", label: `Matches (${played})` },
+        ...(otherTournaments.length > 0 ? [{ key: "past", label: "Past" }] : []),
+    ];
+    const validKeys = tabs.map(t => t.key);
+    const currentTab = validKeys.includes(tournamentTab) ? tournamentTab : "standings";
+
     return (
         <div>
-            <div className="card tournament-top">
-                <div className="tournament-header">
+            {canManage && (
+                <div className="roster-bar tournament-admin-bar">
                     {tournaments.length > 1 ? (
                         <select
-                            className="tournament-picker"
                             value={activeTournament.id}
                             onChange={e => setSelectedId(e.target.value)}
                         >
@@ -1935,24 +2451,58 @@ function TournamentView({ activeRoster, patchActive, showToast, canManage, canSc
                             ))}
                         </select>
                     ) : (
-                        <h2 className="tournament-title">{activeTournament.name}</h2>
+                        <span className="roster-name-static">{activeTournament.name}</span>
                     )}
-                    {ended && <span className="ended-badge">Ended</span>}
-                </div>
-                <div className="tournament-date-row">
-                    {canManage ? (
-                        <input
-                            type="date"
-                            value={activeTournament.date || todayISO()}
-                            onChange={e => setDate(e.target.value)}
-                        />
+                    <button className="btn btn-secondary" onClick={createTournament}>+ New</button>
+                    <button className="btn btn-secondary" onClick={renameTournament}>Rename</button>
+                    {ended ? (
+                        <button className="btn btn-secondary" onClick={reopenTournament}>Reopen</button>
                     ) : (
-                        <span className="tournament-date">{formatDate(activeTournament.date)}</span>
+                        <button className="btn btn-secondary" onClick={endTournament}>End Tournament</button>
                     )}
+                    <button className="btn btn-secondary danger" onClick={deleteTournament}>Delete</button>
+                </div>
+            )}
+
+            {!canManage && tournaments.length > 1 && (
+                <div className="roster-bar">
+                    <span className="roster-label">Tournament</span>
+                    <select
+                        value={activeTournament.id}
+                        onChange={e => setSelectedId(e.target.value)}
+                    >
+                        {tournaments.map(t => (
+                            <option key={t.id} value={t.id}>{t.name}</option>
+                        ))}
+                    </select>
+                </div>
+            )}
+
+            <div className="card tournament-top">
+                <div className="tournament-hero">
+                    <h1 className="tournament-title-big">{activeTournament.name}</h1>
+                    <div className="tournament-hero-date">
+                        {canManage ? (
+                            <input
+                                type="date"
+                                value={activeTournament.date || todayISO()}
+                                onChange={e => setDate(e.target.value)}
+                            />
+                        ) : (
+                            <span className="tournament-date">{formatDate(activeTournament.date)}</span>
+                        )}
+                        {ended && <span className="ended-badge">Ended</span>}
+                    </div>
                 </div>
                 {champion && (
-                    <div className="champion-banner">
-                        🏆 Winner: <strong>{champion.name}</strong>
+                    <div
+                        className="champion-banner"
+                        style={{
+                            background: `${championColor}1a`,
+                            borderColor: championColor,
+                        }}
+                    >
+                        🏆 Winner: <strong style={{ color: championColor }}>{champion.name}</strong>
                     </div>
                 )}
                 <div className="tournament-stats">
@@ -1961,115 +2511,398 @@ function TournamentView({ activeRoster, patchActive, showToast, canManage, canSc
                     <div className="stat"><div className="num">{remainingMatches}</div><div className="label">Remaining</div></div>
                 </div>
                 {canManage && (
-                    <div className="btn-row">
-                        <button className="btn" onClick={createTournament}>+ New</button>
-                        <button className="btn btn-secondary" onClick={renameTournament}>Rename</button>
-                        {ended ? (
-                            <button className="btn btn-secondary" onClick={reopenTournament}>Reopen</button>
-                        ) : (
-                            <button className="btn btn-secondary" onClick={endTournament}>End Tournament</button>
-                        )}
-                        <button className="btn btn-danger" onClick={deleteTournament}>Delete</button>
+                    <div className="duration-grid pre-match-settings">
+                        <label className="duration-field">
+                            <span>Match length</span>
+                            <input type="number" min="1" max="99"
+                                value={activeTournament.matchDurationMin || DEFAULT_MATCH_MIN}
+                                onChange={e => setMatchMin(e.target.value)}
+                                disabled={played > 0}
+                            />
+                            <span className="duration-unit">min</span>
+                        </label>
+                        <label className="duration-field">
+                            <span>Timeout length</span>
+                            <input type="number" min="1" max="10"
+                                value={activeTournament.timeoutDurationMin || DEFAULT_TIMEOUT_MIN}
+                                onChange={e => setTimeoutMin(e.target.value)}
+                                disabled={played > 0}
+                            />
+                            <span className="duration-unit">min</span>
+                        </label>
+                        <p className="help-text duration-help">
+                            {TIMEOUTS_PER_TEAM} timeouts per team per match.
+                            {played > 0 ? " Locked once the first match is recorded." : " Lock in before the first match."}
+                        </p>
                     </div>
+                )}
+                {!canManage && (
+                    <p className="help-text" style={{ textAlign: "center" }}>
+                        {activeTournament.matchDurationMin || DEFAULT_MATCH_MIN} min matches · {activeTournament.timeoutDurationMin || DEFAULT_TIMEOUT_MIN} min timeouts · {TIMEOUTS_PER_TEAM} per team
+                    </p>
                 )}
             </div>
 
-            <div className="card">
-                <h2>Standings</h2>
-                <StandingsTable standings={standings} teams={teams} />
-            </div>
+            <nav className="tournament-tabs">
+                {tabs.map(t => (
+                    <button
+                        key={t.key}
+                        className={currentTab === t.key ? "active" : ""}
+                        onClick={() => setTournamentTab(t.key)}
+                    >{t.label}</button>
+                ))}
+            </nav>
 
-            {canManage ? (
-                <TeamsManagerCard
-                    tournament={activeTournament}
-                    patchTournament={patchTournament}
-                    disabled={ended}
-                    showToast={showToast}
-                />
-            ) : (
-                <PublicTeamsCard tournament={activeTournament} />
+            {currentTab === "standings" && (
+                <div className="card">
+                    <h2>Standings</h2>
+                    <StandingsTable standings={standings} teams={teams} />
+                </div>
             )}
 
-            <FixturesCard tournament={activeTournament} />
+            {currentTab === "teams" && (
+                canManage ? (
+                    <TeamsManagerCard
+                        tournament={activeTournament}
+                        patchTournament={patchTournament}
+                        disabled={ended}
+                        showToast={showToast}
+                    />
+                ) : (
+                    <PublicTeamsCard tournament={activeTournament} />
+                )
+            )}
 
-            {!ended && (canManage || canScore) && (
+            {currentTab === "fixtures" && (
+                <FixturesCard tournament={activeTournament} />
+            )}
+
+            {currentTab === "score" && canRecord && (
                 <TournamentScoreboard
                     tournament={activeTournament}
                     patchTournament={patchTournament}
                     showToast={showToast}
+                    scorerKey={scorerKey}
                 />
             )}
 
-            <div className="card">
-                <h2>Matches Played ({(activeTournament.matches || []).length})</h2>
-                {matches.length === 0 ? (
-                    <div className="empty">No matches recorded yet.</div>
-                ) : (
-                    <div className="match-list">
-                        {matches.map((m, i) => (
-                            <TournamentMatchCard
-                                key={m.id || i}
-                                match={m}
-                                teams={teams}
-                                index={(activeTournament.matches || []).length - 1 - i}
-                                canDelete={canManage || canScore}
-                                onDelete={deleteMatch}
-                            />
-                        ))}
-                    </div>
-                )}
-            </div>
+            {currentTab === "matches" && (
+                <div className="card">
+                    <h2>Matches Played ({(activeTournament.matches || []).length})</h2>
+                    {matches.length === 0 ? (
+                        <div className="empty">No matches recorded yet.</div>
+                    ) : (
+                        <div className="match-list">
+                            {matches.map((m, i) => (
+                                <TournamentMatchCard
+                                    key={m.id || i}
+                                    match={m}
+                                    teams={teams}
+                                    index={(activeTournament.matches || []).length - 1 - i}
+                                    canDelete={canManage || canScore}
+                                    onDelete={deleteMatch}
+                                />
+                            ))}
+                        </div>
+                    )}
+                </div>
+            )}
 
-            <TournamentHistoryCard
-                tournaments={tournaments.filter(t => t.id !== activeTournament.id)}
-                onOpen={(id) => setSelectedId(id)}
-            />
+            {currentTab === "past" && (
+                <TournamentHistoryCard
+                    tournaments={otherTournaments}
+                    onOpen={(id) => { setSelectedId(id); setTournamentTab("standings"); }}
+                />
+            )}
         </div>
     );
 }
 
-function RosterView({ rosters, activeRoster, setActiveRosterId, createRoster, renameRoster, deleteRoster, exportBackup, importBackup }) {
-    const sessionCount = activeRoster?.sessions?.length || 0;
-    const memberCount = activeRoster?.members?.length || 0;
-    const tournamentCount = activeRoster?.tournaments?.length || 0;
+function LiveView({ activeRoster, tournaments, onViewTournament }) {
+    const members = activeRoster?.members || [];
+    const session = activeRoster?.currentSession;
+    const tournamentList = tournaments || [];
+
+    const hasWeeklyMatch = !!session?.teams && Array.isArray(session.teams) && session.teams.length >= 2 && session.teamsFinalized === true;
+
+    // A match is "live" once the scorer has done something — bumped a score,
+    // started the timer, or called a timeout. Pre-match defaults (teams picked
+    // but nothing played yet) stay off the Live tab.
+    const isMatchLive = (m) => {
+        if (!m) return false;
+        if ((m.scoreA || 0) > 0 || (m.scoreB || 0) > 0) return true;
+        if ((m.timeoutsUsedA || 0) > 0 || (m.timeoutsUsedB || 0) > 0) return true;
+        if (m.timerRunning) return true;
+        if ((Number(m.timerAccumMs) || 0) > 0) return true;
+        if (m.timeoutTeam) return true;
+        return false;
+    };
+
+    // Group live matches by tournament so each tournament renders ONE card
+    // (even if several of its courts are live), with the recent-matches list
+    // and View Tournament button appearing once per tournament.
+    const liveTournaments = [];
+    tournamentList.forEach(t => {
+        if (t.endedAt) return;
+        const activeMatches = t.activeMatches || {};
+        const slots = [];
+        Object.entries(activeMatches).forEach(([key, m]) => {
+            if (!m || !m.teamAId || !m.teamBId) return;
+            if (!(t.teams || []).some(x => x.id === m.teamAId)) return;
+            if (!(t.teams || []).some(x => x.id === m.teamBId)) return;
+            if (!isMatchLive(m)) return;
+            slots.push({ match: m, slotKey: key });
+        });
+        if (slots.length > 0) liveTournaments.push({ tournament: t, slots });
+    });
+
+    if (!hasWeeklyMatch && liveTournaments.length === 0) {
+        return (
+            <div className="card">
+                <div className="empty">
+                    No live match right now. Check back when a game is in progress.
+                </div>
+            </div>
+        );
+    }
+
     return (
         <div>
-            <div className="card">
-                <h2>Rosters ({rosters.length})</h2>
-                <div className="row" style={{ flexWrap: "wrap", gap: "0.5rem" }}>
-                    <select
-                        value={activeRoster.id}
-                        onChange={e => setActiveRosterId(e.target.value)}
-                        style={{ flex: 1, minWidth: 180 }}
-                    >
-                        {rosters.map(r => (
-                            <option key={r.id} value={r.id}>{r.name}</option>
+            {hasWeeklyMatch && (
+                <WeeklyLiveCard session={session} members={members} roster={activeRoster} />
+            )}
+            {liveTournaments.map(({ tournament, slots }) => (
+                <TournamentLiveCard
+                    key={tournament.id}
+                    tournament={tournament}
+                    slots={slots}
+                    onViewTournament={onViewTournament}
+                />
+            ))}
+        </div>
+    );
+}
+
+function LiveTimerDisplay({ state, matchDurationMin, timeoutDurationMin, timeoutColor }) {
+    const running = !!state?.timerRunning;
+    const timeoutTeam = state?.timeoutTeam || null;
+    const [now, setNow] = useState(() => Date.now());
+    useEffect(() => {
+        if (!running && !timeoutTeam) return;
+        setNow(Date.now());
+        const id = setInterval(() => setNow(Date.now()), 1000);
+        return () => clearInterval(id);
+    }, [running, timeoutTeam]);
+    const match = computeMatchTime(state, matchDurationMin, now);
+    const toT = computeTimeoutTime(state, timeoutDurationMin, now);
+    const mm = Math.floor(match.remainingSec / 60);
+    const ss = match.remainingSec % 60;
+    const toMM = Math.floor(toT.remainingSec / 60);
+    const toSS = toT.remainingSec % 60;
+    const isTimeout = !!timeoutTeam && !!timeoutColor;
+    const tileStyle = isTimeout ? {
+        borderColor: timeoutColor,
+        background: `${timeoutColor}1a`,
+    } : undefined;
+    const textStyle = isTimeout ? { color: timeoutColor } : undefined;
+    return (
+        <div className={`live-timer-row${match.expired ? " expired" : ""}${isTimeout ? " timeout" : ""}`}>
+            <div className="live-timer" style={tileStyle}>
+                <span className="live-timer-label" style={textStyle}>
+                    {timeoutTeam ? "Timeout" : (running ? "Live" : (match.elapsedSec > 0 ? "Paused" : "Pre-match"))}
+                </span>
+                <span className="live-timer-value" style={textStyle}>
+                    {timeoutTeam
+                        ? `${toMM}:${toSS.toString().padStart(2, "0")}`
+                        : `${mm}:${ss.toString().padStart(2, "0")}`}
+                </span>
+            </div>
+        </div>
+    );
+}
+
+function TimeoutsBadge({ color, used, label }) {
+    return (
+        <div className="live-timeouts">
+            <span className="live-timeouts-label">{label}</span>
+            <div className="timeout-dots" style={{ "--team-color": color }}>
+                {Array.from({ length: TIMEOUTS_PER_TEAM }).map((_, i) => (
+                    <span key={i} className={`timeout-dot${i < (used || 0) ? " used" : ""}`}></span>
+                ))}
+            </div>
+        </div>
+    );
+}
+
+function WeeklyLiveCard({ session, members, roster }) {
+    const teams = session.teams;
+    const sb = session.scoreboard || {};
+    let teamIdxA = Number.isInteger(sb.teamIdxA) ? sb.teamIdxA : 0;
+    let teamIdxB = Number.isInteger(sb.teamIdxB) ? sb.teamIdxB : 1;
+    if (teamIdxA >= teams.length) teamIdxA = 0;
+    if (teamIdxB >= teams.length) teamIdxB = Math.min(1, teams.length - 1);
+    if (teamIdxA === teamIdxB) teamIdxB = (teamIdxA + 1) % teams.length;
+    const scoreA = sb.scoreA || 0;
+    const scoreB = sb.scoreB || 0;
+    const timeoutsUsedA = sb.timeoutsUsedA || 0;
+    const timeoutsUsedB = sb.timeoutsUsedB || 0;
+    const labelA = String.fromCharCode(65 + teamIdxA);
+    const labelB = String.fromCharCode(65 + teamIdxB);
+    const teamA = (teams[teamIdxA] || []).map(id => members.find(m => m.id === id)).filter(Boolean);
+    const teamB = (teams[teamIdxB] || []).map(id => members.find(m => m.id === id)).filter(Boolean);
+    const aWin = scoreA > scoreB;
+    const bWin = scoreB > scoreA;
+    const WEEKLY_HEX = ["#FF4D6D", "#00F0FF", "#FFC107"];
+    const colorA = WEEKLY_HEX[teamIdxA % 3];
+    const colorB = WEEKLY_HEX[teamIdxB % 3];
+
+    return (
+        <div className="card">
+            <div className="live-head">
+                <span className="live-badge"><span className="live-dot"></span>LIVE</span>
+                <div className="live-title">
+                    <h2>{roster?.name || "Session"}</h2>
+                    <span className="live-sub">{formatDate(session.date)}</span>
+                </div>
+            </div>
+            <LiveTimerDisplay
+                state={sb}
+                matchDurationMin={session.matchDurationMin || DEFAULT_MATCH_MIN}
+                timeoutDurationMin={session.timeoutDurationMin || DEFAULT_TIMEOUT_MIN}
+                timeoutColor={sb.timeoutTeam === "A" ? colorA : sb.timeoutTeam === "B" ? colorB : null}
+            />
+            <div className="scoreboard-teams scoreboard-2team">
+                <div className={`scoreboard-team team-${teamIdxA + 1}`}>
+                    <div className="jersey">{labelA}</div>
+                    <div className={`score-value${aWin ? " leading" : ""}`}>{scoreA}</div>
+                    <TimeoutsBadge color={colorA} used={timeoutsUsedA} label="Timeouts" />
+                </div>
+                <div className="vs-label">VS</div>
+                <div className={`scoreboard-team team-${teamIdxB + 1}`}>
+                    <div className="jersey">{labelB}</div>
+                    <div className={`score-value${bWin ? " leading" : ""}`}>{scoreB}</div>
+                    <TimeoutsBadge color={colorB} used={timeoutsUsedB} label="Timeouts" />
+                </div>
+            </div>
+            <div className="teams-grid live-teams">
+                {[{ idx: teamIdxA, label: labelA, team: teamA }, { idx: teamIdxB, label: labelB, team: teamB }].map(({ idx, label, team }) => (
+                    <div key={idx} className={`team team-${idx + 1}`}>
+                        <div className="team-header">
+                            <div className="jersey">{label}</div>
+                            <div className="team-title">
+                                <span className="name">Team {label}</span>
+                                <span className="meta">{team.length} Players</span>
+                            </div>
+                        </div>
+                        <div className="team-players">
+                            {team.map(p => (
+                                <div key={p.id} className="team-player" style={{ cursor: "default" }}>
+                                    <span>{p.name}</span>
+                                </div>
+                            ))}
+                        </div>
+                    </div>
+                ))}
+            </div>
+            {Array.isArray(session.matches) && session.matches.length > 0 && (
+                <>
+                    <h3 style={{ marginTop: "1.5rem" }}>Matches this session</h3>
+                    <div className="match-list">
+                        {session.matches.map((m, i) => (
+                            <MatchCard key={m.id || i} match={m} index={i} />
                         ))}
-                    </select>
-                    <button className="btn" onClick={createRoster}>+ New</button>
-                    <button className="btn btn-secondary" onClick={renameRoster}>Rename</button>
-                    <button className="btn btn-danger" onClick={deleteRoster}>Delete</button>
-                    <button className="btn btn-secondary" onClick={exportBackup} title="Download all data as JSON">Backup to file</button>
-                    <button className="btn btn-secondary" onClick={importBackup} title="Restore from a backup file">Restore from file</button>
+                    </div>
+                </>
+            )}
+        </div>
+    );
+}
+
+function TournamentLiveMatch({ tournament, match: am }) {
+    const teams = tournament.teams || [];
+    const aIdx = teams.findIndex(t => t.id === am.teamAId);
+    const bIdx = teams.findIndex(t => t.id === am.teamBId);
+    const a = aIdx >= 0 ? teams[aIdx] : null;
+    const b = bIdx >= 0 ? teams[bIdx] : null;
+    if (!a || !b) return null;
+    const scoreA = am.scoreA || 0;
+    const scoreB = am.scoreB || 0;
+    const timeoutsUsedA = am.timeoutsUsedA || 0;
+    const timeoutsUsedB = am.timeoutsUsedB || 0;
+    const colorA = teamColor(aIdx);
+    const colorB = teamColor(bIdx);
+    const aWin = scoreA > scoreB;
+    const bWin = scoreB > scoreA;
+    return (
+        <div className="live-match-block">
+            <LiveTimerDisplay
+                state={am}
+                matchDurationMin={tournament.matchDurationMin || DEFAULT_MATCH_MIN}
+                timeoutDurationMin={tournament.timeoutDurationMin || DEFAULT_TIMEOUT_MIN}
+                timeoutColor={am.timeoutTeam === "A" ? colorA : am.timeoutTeam === "B" ? colorB : null}
+            />
+            <div className="scoreboard-teams scoreboard-2team">
+                <div className="scoreboard-team" style={{ "--team-color": colorA }}>
+                    <div className="t-live-team-name" style={{ color: colorA }}>{a.name}</div>
+                    <div className={`score-value${aWin ? " leading" : ""}`}>{scoreA}</div>
+                    <TimeoutsBadge color={colorA} used={timeoutsUsedA} label="Timeouts" />
+                </div>
+                <div className="vs-label">VS</div>
+                <div className="scoreboard-team" style={{ "--team-color": colorB }}>
+                    <div className="t-live-team-name" style={{ color: colorB }}>{b.name}</div>
+                    <div className={`score-value${bWin ? " leading" : ""}`}>{scoreB}</div>
+                    <TimeoutsBadge color={colorB} used={timeoutsUsedB} label="Timeouts" />
                 </div>
             </div>
-            <div className="card">
-                <h2 style={{ marginBottom: "0.75rem" }}>{activeRoster.name}</h2>
-                <div className="stats-bar">
-                    <div className="stat">
-                        <div className="num">{memberCount}</div>
-                        <div className="label">Members</div>
-                    </div>
-                    <div className="stat">
-                        <div className="num">{sessionCount}</div>
-                        <div className="label">Sessions</div>
-                    </div>
-                    <div className="stat">
-                        <div className="num">{tournamentCount}</div>
-                        <div className="label">Tournaments</div>
-                    </div>
+        </div>
+    );
+}
+
+function TournamentLiveCard({ tournament, slots, onViewTournament }) {
+    const teams = tournament.teams || [];
+    const allMatches = tournament.matches || [];
+    const recentMatches = allMatches.slice(-3).reverse();
+    const multi = slots.length > 1;
+    return (
+        <div className="card">
+            <div className="live-head">
+                <span className="live-badge"><span className="live-dot"></span>LIVE</span>
+                <div className="live-title">
+                    <h2>{tournament.name}</h2>
+                    <span className="live-sub">
+                        Tournament · {formatDate(tournament.date)}
+                        {multi && ` · ${slots.length} courts live`}
+                    </span>
                 </div>
             </div>
+            {slots.map(({ match, slotKey }, i) => (
+                <React.Fragment key={slotKey}>
+                    {i > 0 && <div className="live-match-divider" />}
+                    <TournamentLiveMatch tournament={tournament} match={match} />
+                </React.Fragment>
+            ))}
+            {recentMatches.length > 0 && (
+                <>
+                    <h3 className="live-section-title">Last {recentMatches.length} match{recentMatches.length === 1 ? "" : "es"}</h3>
+                    <div className="match-list">
+                        {recentMatches.map((m, i) => (
+                            <TournamentMatchCard
+                                key={m.id || i}
+                                match={m}
+                                teams={teams}
+                                index={allMatches.length - 1 - i}
+                            />
+                        ))}
+                    </div>
+                </>
+            )}
+            {onViewTournament && (
+                <div className="btn-row">
+                    <button className="btn" onClick={() => onViewTournament(tournament.id)}>
+                        View Tournament →
+                    </button>
+                </div>
+            )}
         </div>
     );
 }
@@ -2079,18 +2912,23 @@ function App() {
     const initial = stored || {
         rosters: [{ id: uid(), name: "Volleyball Group", members: seedRoster(), sessions: [], currentSession: null }],
         activeRosterId: null,
+        tournaments: [],
     };
     if (!initial.activeRosterId && initial.rosters.length > 0) {
         initial.activeRosterId = initial.rosters[0].id;
     }
+    if (!Array.isArray(initial.tournaments)) initial.tournaments = [];
 
     const [rosters, setRosters] = useState(initial.rosters);
     const [activeRosterId, setActiveRosterId] = useState(initial.activeRosterId);
+    const [tournaments, setTournaments] = useState(initial.tournaments);
     // Non-admin viewers can switch which roster they're looking at without
     // affecting the admin's active roster. Null = follow admin's active roster.
     const [viewingRosterId, setViewingRosterId] = useState(null);
-    const [section, setSection] = useState("weekly");
+    const [section, setSection] = useState("live");
     const [tab, setTab] = useState("week");
+    const [tournamentTab, setTournamentTab] = useState("standings");
+    const [selectedTournamentId, setSelectedTournamentId] = useState(null);
     const [toast, setToast] = useState(null);
     const [user, setUser] = useState(null);
     const [authReady, setAuthReady] = useState(false);
@@ -2137,6 +2975,7 @@ function App() {
                 lastSyncedRef.current = serialized;
                 setRosters(normalized.rosters);
                 setActiveRosterId(normalized.activeRosterId);
+                setTournaments(normalized.tournaments || []);
             } else {
                 console.log("[cloud] snapshot matches local — ignored");
             }
@@ -2150,7 +2989,7 @@ function App() {
 
     // Save: localStorage always; Firestore only when signed in AS admin (debounced).
     useEffect(() => {
-        saveState({ rosters, activeRosterId });
+        saveState({ rosters, activeRosterId, tournaments });
         const canWrite = user?.uid === ADMIN_UID || user?.uid === SCORER_UID;
         if (!canWrite || !cloudReady) {
             console.log("[cloud] skip write — gate failed", {
@@ -2158,7 +2997,7 @@ function App() {
             });
             return;
         }
-        const payload = { rosters, activeRosterId };
+        const payload = { rosters, activeRosterId, tournaments };
         const serialized = JSON.stringify(payload);
         if (serialized === lastSyncedRef.current) {
             console.log("[cloud] skip write — unchanged");
@@ -2181,7 +3020,7 @@ function App() {
                 });
         }, 500);
         return () => clearTimeout(t);
-    }, [rosters, activeRosterId, user, cloudReady]);
+    }, [rosters, activeRosterId, tournaments, user, cloudReady]);
 
     const signIn = () => auth.signInWithPopup(googleProvider)
         .catch(err => alert("Sign-in failed: " + err.message));
@@ -2193,13 +3032,19 @@ function App() {
     // Keep the sub-tab valid for the current role. Tournament is a top-level
     // section now, not a sub-tab, so it's not in these lists.
     useEffect(() => {
-        const valid = isAdmin ? ["roster", "week", "members", "history"]
+        const valid = isAdmin ? ["week", "members", "history"]
                     : isScorer ? ["match", "members", "history"]
                     : ["members", "history"];
         if (!valid.includes(tab)) {
             setTab(isAdmin ? "week" : isScorer ? "match" : "members");
         }
     }, [isAdmin, isScorer, tab]);
+
+    const navigateToTournament = (tournamentId) => {
+        setSelectedTournamentId(tournamentId);
+        setTournamentTab("standings");
+        setSection("tournament");
+    };
 
     const activeRoster = rosters.find(r => r.id === activeRosterId) || rosters[0];
     const viewingRoster = rosters.find(r => r.id === viewingRosterId) || activeRoster;
@@ -2234,7 +3079,6 @@ function App() {
             members: useBlank ? [] : seedRoster(),
             sessions: [],
             currentSession: null,
-            tournaments: [],
         };
         setRosters([...rosters, newRoster]);
         setActiveRosterId(newRoster.id);
@@ -2268,10 +3112,11 @@ function App() {
     const exportBackup = () => {
         const payload = {
             kind: "volleyball-organizer-backup",
-            version: 3,
+            version: 4,
             exportedAt: new Date().toISOString(),
             rosters,
             activeRosterId,
+            tournaments,
         };
         const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
         const url = URL.createObjectURL(blob);
@@ -2320,6 +3165,7 @@ function App() {
                 )) return;
                 setRosters(normalized.rosters);
                 setActiveRosterId(normalized.activeRosterId);
+                setTournaments(normalized.tournaments || []);
                 setToast("Backup restored");
             };
             reader.readAsText(file);
@@ -2361,6 +3207,10 @@ function App() {
 
             <nav className="section-nav">
                 <button
+                    className={section === "live" ? "active" : ""}
+                    onClick={() => setSection("live")}
+                >Live</button>
+                <button
                     className={section === "weekly" ? "active" : ""}
                     onClick={() => setSection("weekly")}
                 >Weekly / Daily Games</button>
@@ -2370,10 +3220,26 @@ function App() {
                 >Tournament</button>
             </nav>
 
-            {section === "weekly" && !isAdmin && (
+            {section === "weekly" && (
                 <div className="roster-bar">
                     <span className="roster-label">Roster</span>
-                    {isScorer ? (
+                    {isAdmin ? (
+                        <>
+                            <select
+                                value={activeRoster.id}
+                                onChange={e => setActiveRosterId(e.target.value)}
+                            >
+                                {rosters.map(r => (
+                                    <option key={r.id} value={r.id}>{r.name}</option>
+                                ))}
+                            </select>
+                            <button className="btn btn-secondary" onClick={createRoster}>+ New</button>
+                            <button className="btn btn-secondary" onClick={renameRoster}>Rename</button>
+                            <button className="btn btn-secondary danger" onClick={deleteRoster}>Delete</button>
+                            <button className="btn btn-secondary" onClick={exportBackup} title="Download all data as JSON">Backup</button>
+                            <button className="btn btn-secondary" onClick={importBackup} title="Restore from a backup file">Restore</button>
+                        </>
+                    ) : isScorer ? (
                         <span className="roster-name-static">{activeRoster?.name || "—"}</span>
                     ) : rosters.length > 1 ? (
                         <select
@@ -2390,35 +3256,33 @@ function App() {
                 </div>
             )}
 
-            {section === "tournament" ? (
+            {section === "live" ? (
+                <LiveView
+                    key={activeRoster?.id + "-live"}
+                    activeRoster={activeRoster}
+                    tournaments={tournaments}
+                    onViewTournament={navigateToTournament}
+                />
+            ) : section === "tournament" ? (
                 <TournamentView
-                    key={(isAdmin || isScorer ? activeRoster?.id : viewingRoster?.id) + "-tournament"}
-                    activeRoster={isAdmin || isScorer ? activeRoster : viewingRoster}
-                    patchActive={isAdmin || isScorer ? patchActive : () => {}}
+                    tournaments={tournaments}
+                    setTournaments={isAdmin || isScorer ? setTournaments : () => {}}
                     showToast={setToast}
                     canManage={isAdmin}
                     canScore={isAdmin || isScorer}
+                    tournamentTab={tournamentTab}
+                    setTournamentTab={setTournamentTab}
+                    selectedTournamentId={selectedTournamentId}
+                    setSelectedTournamentId={setSelectedTournamentId}
+                    scorerKey={user?.uid || "anonymous"}
                 />
             ) : isAdmin ? (
                 <>
                     <nav>
-                        <button className={tab === "roster" ? "active" : ""} onClick={() => setTab("roster")}>Roster</button>
                         <button className={tab === "week" ? "active" : ""} onClick={() => setTab("week")}>This Week</button>
                         <button className={tab === "members" ? "active" : ""} onClick={() => setTab("members")}>Members</button>
                         <button className={tab === "history" ? "active" : ""} onClick={() => setTab("history")}>History</button>
                     </nav>
-                    {tab === "roster" && (
-                        <RosterView
-                            rosters={rosters}
-                            activeRoster={activeRoster}
-                            setActiveRosterId={setActiveRosterId}
-                            createRoster={createRoster}
-                            renameRoster={renameRoster}
-                            deleteRoster={deleteRoster}
-                            exportBackup={exportBackup}
-                            importBackup={importBackup}
-                        />
-                    )}
                     {tab === "week" && (
                         <ThisWeekView
                             key={activeRoster.id}
