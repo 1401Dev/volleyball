@@ -9,7 +9,7 @@ const firebaseConfig = {
   storageBucket: "sport-organize.firebasestorage.app",
   messagingSenderId: "122207828807",
   appId: "1:122207828807:web:2a7d6b821fdef7aebcaa62"
-};
+}; 
 firebase.initializeApp(firebaseConfig);
 const auth = firebase.auth();
 const db = firebase.firestore();
@@ -18,6 +18,8 @@ db.enablePersistence({ synchronizeTabs: true }).catch(() => {});
 const googleProvider = new firebase.auth.GoogleAuthProvider();
 // Only this user can edit; everyone else sees a read-only view.
 const ADMIN_UID = "GiQwaYz7zGeG2bipauadUFO36NI3";
+// Scorer may update match scores and the timer, but cannot touch rosters/members.
+const SCORER_UID = "NhW9PukZFnVOmjnTOU5861Tfje03";
 // ---------------------------------------------------------------------------
 
 const STORAGE_KEY = "volleyball-organizer-v3";
@@ -307,6 +309,245 @@ function MembersView({ members, setMembers, resetToPreset }) {
                     ))
                 )}
             </div>
+        </div>
+    );
+}
+
+// Pretty match result card used by Scoreboard and both History views.
+function MatchCard({ match, index }) {
+    const aLabel = String.fromCharCode(65 + match.teamIdxA);
+    const bLabel = String.fromCharCode(65 + match.teamIdxB);
+    const aWin = match.scoreA > match.scoreB;
+    const bWin = match.scoreB > match.scoreA;
+    const mins = Math.floor((match.durationSec || 0) / 60);
+    const secs = (match.durationSec || 0) % 60;
+    return (
+        <div className="match-card">
+            <div className="match-card-header">
+                <span className="match-card-num">Match {index + 1}</span>
+                <span className="match-card-time">
+                    {mins}:{secs.toString().padStart(2, "0")}
+                </span>
+            </div>
+            <div className="match-card-body">
+                <div className={`match-side team-${match.teamIdxA + 1}${aWin ? " winner" : ""}`}>
+                    <span className="match-side-label">Team {aLabel}</span>
+                    <span className="match-side-score">{match.scoreA}</span>
+                </div>
+                <div className={`match-side team-${match.teamIdxB + 1}${bWin ? " winner" : ""}`}>
+                    <span className="match-side-label">Team {bLabel}</span>
+                    <span className="match-side-score">{match.scoreB}</span>
+                </div>
+            </div>
+        </div>
+    );
+}
+
+// Bell-like chime that plays for ~4 seconds when the timer expires.
+// No audio file — synthesised in-browser via Web Audio API.
+const playTimerAlarm = () => {
+    try {
+        const Ctx = window.AudioContext || window.webkitAudioContext;
+        if (!Ctx) return;
+        const ctx = new Ctx();
+        const now = ctx.currentTime;
+
+        // Bell = sine fundamental + softer 2nd harmonic, both decaying exponentially.
+        const bell = (startAt, freq, dur = 1.6, vol = 0.4) => {
+            const osc = ctx.createOscillator();
+            const gain = ctx.createGain();
+            osc.type = "sine";
+            osc.frequency.value = freq;
+            gain.gain.setValueAtTime(0, startAt);
+            gain.gain.linearRampToValueAtTime(vol, startAt + 0.01);
+            gain.gain.exponentialRampToValueAtTime(0.001, startAt + dur);
+            osc.connect(gain).connect(ctx.destination);
+            osc.start(startAt);
+            osc.stop(startAt + dur);
+
+            const osc2 = ctx.createOscillator();
+            const gain2 = ctx.createGain();
+            osc2.type = "sine";
+            osc2.frequency.value = freq * 2.01;
+            gain2.gain.setValueAtTime(0, startAt);
+            gain2.gain.linearRampToValueAtTime(vol * 0.4, startAt + 0.01);
+            gain2.gain.exponentialRampToValueAtTime(0.001, startAt + dur * 0.75);
+            osc2.connect(gain2).connect(ctx.destination);
+            osc2.start(startAt);
+            osc2.stop(startAt + dur * 0.75);
+        };
+
+        // Ascending C major arpeggio: C5 → E5 → G5, then a long final C6.
+        bell(now,        523.25, 1.4);
+        bell(now + 0.55, 659.25, 1.4);
+        bell(now + 1.10, 783.99, 1.4);
+        bell(now + 1.80, 1046.50, 2.4, 0.5);
+
+        setTimeout(() => ctx.close().catch(() => {}), 4500);
+    } catch (e) {
+        console.warn("[alarm] could not play:", e);
+    }
+};
+
+function Scoreboard({ session, teams, onUpdate, onEndMatch, showToast, canEdit }) {
+    const teamLabels = teams.map((_, i) => String.fromCharCode(65 + i));
+    const sb = session.scoreboard || {};
+    // Default: first two teams play; clamp to valid indices.
+    let teamIdxA = Number.isInteger(sb.teamIdxA) ? sb.teamIdxA : 0;
+    let teamIdxB = Number.isInteger(sb.teamIdxB) ? sb.teamIdxB : 1;
+    if (teamIdxA >= teams.length) teamIdxA = 0;
+    if (teamIdxB >= teams.length) teamIdxB = Math.min(1, teams.length - 1);
+    if (teamIdxA === teamIdxB) teamIdxB = (teamIdxA + 1) % teams.length;
+    const scoreA = sb.scoreA || 0;
+    const scoreB = sb.scoreB || 0;
+
+    const [durationMin, setDurationMin] = useState(11);
+    const [elapsedSec, setElapsedSec] = useState(0);
+    const [running, setRunning] = useState(false);
+    const durationSec = Math.max(1, durationMin) * 60;
+
+    useEffect(() => {
+        if (!running) return;
+        const id = setInterval(() => {
+            setElapsedSec(e => {
+                if (e + 1 >= durationSec) {
+                    setRunning(false);
+                    playTimerAlarm();
+                    return durationSec;
+                }
+                return e + 1;
+            });
+        }, 1000);
+        return () => clearInterval(id);
+    }, [running, durationSec]);
+
+    const remainingSec = Math.max(0, durationSec - elapsedSec);
+    const mm = Math.floor(remainingSec / 60);
+    const ss = remainingSec % 60;
+    const timeExpired = remainingSec === 0;
+
+    const bump = (which, delta) => {
+        if (!canEdit) return;
+        if (which === "A") onUpdate({ scoreA: Math.max(0, scoreA + delta), teamIdxA, teamIdxB });
+        else onUpdate({ scoreB: Math.max(0, scoreB + delta), teamIdxA, teamIdxB });
+    };
+
+    const pickTeam = (which, newIdx) => {
+        if (!canEdit) return;
+        if (which === "A") {
+            const nextB = newIdx === teamIdxB ? teamIdxA : teamIdxB;
+            onUpdate({ teamIdxA: newIdx, teamIdxB: nextB, scoreA: 0, scoreB: 0 });
+        } else {
+            const nextA = newIdx === teamIdxA ? teamIdxB : teamIdxA;
+            onUpdate({ teamIdxA: nextA, teamIdxB: newIdx, scoreA: 0, scoreB: 0 });
+        }
+    };
+
+    const resetScores = () => {
+        if (!canEdit) return;
+        if (!confirm("Reset both scores to 0?")) return;
+        onUpdate({ scoreA: 0, scoreB: 0, teamIdxA, teamIdxB });
+    };
+
+    const resetTimer = () => {
+        setElapsedSec(0);
+        setRunning(false);
+    };
+
+    const endMatch = () => {
+        if (!canEdit) return;
+        if (scoreA === 0 && scoreB === 0) {
+            if (!confirm("Both scores are 0. Record this match anyway?")) return;
+        } else if (!confirm("End this match? Score will be saved to the session.")) {
+            return;
+        }
+        onEndMatch({
+            id: uid(),
+            teamIdxA, teamIdxB,
+            scoreA, scoreB,
+            durationSec: elapsedSec,
+            endedAt: new Date().toISOString(),
+        });
+        setElapsedSec(0);
+        setRunning(false);
+        showToast?.("Match recorded");
+    };
+
+    const renderScoreTile = (which, idx, score) => (
+        <div key={which} className={`scoreboard-team team-${idx + 1}`}>
+            {teams.length > 2 ? (
+                <select
+                    className="scoreboard-team-picker"
+                    value={idx}
+                    onChange={e => pickTeam(which, Number(e.target.value))}
+                    disabled={!canEdit}
+                >
+                    {teams.map((_, i) => (
+                        <option key={i} value={i}>Team {teamLabels[i]}</option>
+                    ))}
+                </select>
+            ) : (
+                <div className="jersey">{teamLabels[idx]}</div>
+            )}
+            <div className="score-value">{score}</div>
+            <div className="score-controls">
+                <button className="btn btn-secondary" onClick={() => bump(which, -1)} disabled={!canEdit} aria-label={`Team ${teamLabels[idx]} minus one`}>−</button>
+                <button className="btn" onClick={() => bump(which, +1)} disabled={!canEdit} aria-label={`Team ${teamLabels[idx]} plus one`}>+</button>
+            </div>
+        </div>
+    );
+
+    return (
+        <div className="card">
+            <h2>Scoreboard</h2>
+            <div className={`scoreboard-timer${timeExpired ? " expired" : ""}`}>
+                <div className="timer-display">
+                    {mm}:{ss.toString().padStart(2, "0")}
+                </div>
+                <div className="timer-controls">
+                    <button
+                        className="btn"
+                        onClick={() => setRunning(r => !r)}
+                        disabled={timeExpired && !running}
+                    >
+                        {running ? "Pause" : (elapsedSec > 0 ? "Resume" : "Start")}
+                    </button>
+                    <button className="btn btn-secondary" onClick={resetTimer}>Reset</button>
+                    <label className="duration-input">
+                        <span>Length</span>
+                        <input
+                            type="number"
+                            min="1"
+                            max="99"
+                            value={durationMin}
+                            onChange={e => setDurationMin(Math.max(1, Number(e.target.value) || 1))}
+                            disabled={running}
+                        />
+                        <span>min</span>
+                    </label>
+                </div>
+            </div>
+            <div className="scoreboard-teams scoreboard-2team">
+                {renderScoreTile("A", teamIdxA, scoreA)}
+                <div className="vs-label">VS</div>
+                {renderScoreTile("B", teamIdxB, scoreB)}
+            </div>
+            {canEdit && (
+                <div className="btn-row">
+                    <button className="btn btn-secondary" onClick={resetScores}>Reset Scores</button>
+                    <button className="btn" onClick={endMatch}>End Match</button>
+                </div>
+            )}
+            {Array.isArray(session.matches) && session.matches.length > 0 && (
+                <>
+                    <h3 style={{ marginTop: "1.5rem" }}>Matches this session</h3>
+                    <div className="match-list">
+                        {session.matches.map((m, i) => (
+                            <MatchCard key={m.id || i} match={m} index={i} />
+                        ))}
+                    </div>
+                </>
+            )}
         </div>
     );
 }
@@ -627,6 +868,28 @@ function ThisWeekView({ members, currentSession, setCurrentSession, saveSession,
                     </div>
                 </div>
             )}
+
+            {currentSession.teams && (
+                <Scoreboard
+                    session={currentSession}
+                    teams={currentSession.teams}
+                    canEdit={true}
+                    onUpdate={(patch) => setCurrentSession({
+                        ...currentSession,
+                        scoreboard: { ...(currentSession.scoreboard || {}), ...patch },
+                    })}
+                    onEndMatch={(match) => setCurrentSession({
+                        ...currentSession,
+                        matches: [...(currentSession.matches || []), match],
+                        scoreboard: {
+                            ...(currentSession.scoreboard || {}),
+                            scoreA: 0,
+                            scoreB: 0,
+                        },
+                    })}
+                    showToast={showToast}
+                />
+            )}
         </div>
     );
 }
@@ -651,7 +914,9 @@ function HistoryView({ sessions, members, deleteSession }) {
                     <div className="session-row" onClick={() => setExpanded(expanded === s.id ? null : s.id)}>
                         <div className="session-date">{formatDate(s.date)}</div>
                         <div className="session-meta">
-                            {s.available.length} players · {s.teams ? `${s.teams.length} teams` : "no teams"}
+                            {s.available.length} players
+                            {s.teams ? ` · ${s.teams.length} teams` : " · no teams"}
+                            {Array.isArray(s.matches) && s.matches.length > 0 && ` · ${s.matches.length} match${s.matches.length === 1 ? "" : "es"}`}
                         </div>
                     </div>
                     {expanded === s.id && s.teams && (
@@ -679,6 +944,16 @@ function HistoryView({ sessions, members, deleteSession }) {
                                     );
                                 })}
                             </div>
+                            {Array.isArray(s.matches) && s.matches.length > 0 && (
+                                <>
+                                    <h3 style={{ marginTop: "1rem" }}>Matches</h3>
+                                    <div className="match-list">
+                                        {s.matches.map((m, i) => (
+                                            <MatchCard key={m.id || i} match={m} index={i} />
+                                        ))}
+                                    </div>
+                                </>
+                            )}
                             <div className="btn-row">
                                 <button className="btn btn-danger" onClick={() => {
                                     if (confirm("Delete this session?")) deleteSession(s.id);
@@ -689,6 +964,49 @@ function HistoryView({ sessions, members, deleteSession }) {
                 </div>
             ))}
         </div>
+    );
+}
+
+function MatchView({ activeRoster, patchActive, showToast }) {
+    const currentSession = activeRoster?.currentSession;
+    const teams = currentSession?.teams;
+
+    if (!currentSession || !teams) {
+        return (
+            <div className="card">
+                <div className="empty">
+                    No active match. Ask the admin to start a session and generate teams.
+                </div>
+            </div>
+        );
+    }
+
+    return (
+        <Scoreboard
+            session={currentSession}
+            teams={teams}
+            canEdit={true}
+            showToast={showToast}
+            onUpdate={(patch) => patchActive(r => ({
+                ...r,
+                currentSession: {
+                    ...r.currentSession,
+                    scoreboard: { ...(r.currentSession?.scoreboard || {}), ...patch },
+                },
+            }))}
+            onEndMatch={(match) => patchActive(r => ({
+                ...r,
+                currentSession: {
+                    ...r.currentSession,
+                    matches: [...(r.currentSession?.matches || []), match],
+                    scoreboard: {
+                        ...(r.currentSession?.scoreboard || {}),
+                        scoreA: 0,
+                        scoreB: 0,
+                    },
+                },
+            }))}
+        />
     );
 }
 
@@ -732,7 +1050,9 @@ function PublicHistoryView({ sessions, members }) {
                     <div className="session-row" onClick={() => setExpanded(expanded === s.id ? null : s.id)}>
                         <div className="session-date">{formatDate(s.date)}</div>
                         <div className="session-meta">
-                            {s.available.length} players · {s.teams ? `${s.teams.length} teams` : "no teams"}
+                            {s.available.length} players
+                            {s.teams ? ` · ${s.teams.length} teams` : " · no teams"}
+                            {Array.isArray(s.matches) && s.matches.length > 0 && ` · ${s.matches.length} match${s.matches.length === 1 ? "" : "es"}`}
                         </div>
                     </div>
                     {expanded === s.id && s.teams && (
@@ -760,6 +1080,16 @@ function PublicHistoryView({ sessions, members }) {
                                     );
                                 })}
                             </div>
+                            {Array.isArray(s.matches) && s.matches.length > 0 && (
+                                <>
+                                    <h3 style={{ marginTop: "1rem" }}>Matches</h3>
+                                    <div className="match-list">
+                                        {s.matches.map((m, i) => (
+                                            <MatchCard key={m.id || i} match={m} index={i} />
+                                        ))}
+                                    </div>
+                                </>
+                            )}
                         </div>
                     )}
                 </div>
@@ -844,9 +1174,10 @@ function App() {
     // Save: localStorage always; Firestore only when signed in AS admin (debounced).
     useEffect(() => {
         saveState({ rosters, activeRosterId });
-        if (user?.uid !== ADMIN_UID || !cloudReady) {
+        const canWrite = user?.uid === ADMIN_UID || user?.uid === SCORER_UID;
+        if (!canWrite || !cloudReady) {
             console.log("[cloud] skip write — gate failed", {
-                uid: user?.uid, isAdmin: user?.uid === ADMIN_UID, cloudReady,
+                uid: user?.uid, canWrite, cloudReady,
             });
             return;
         }
@@ -880,11 +1211,17 @@ function App() {
     const signOut = () => auth.signOut();
 
     const isAdmin = user?.uid === ADMIN_UID;
+    const isScorer = user?.uid === SCORER_UID;
 
-    // Non-admins can't see "This Week"; bounce them to Members.
+    // Default-tab routing per role: admin→week, scorer→match, visitor→members.
     useEffect(() => {
-        if (!isAdmin && tab === "week") setTab("members");
-    }, [isAdmin, tab]);
+        if (isAdmin) return;
+        if (isScorer) {
+            if (tab === "week") setTab("match");
+        } else {
+            if (tab === "week" || tab === "match") setTab("members");
+        }
+    }, [isAdmin, isScorer, tab]);
 
     const activeRoster = rosters.find(r => r.id === activeRosterId) || rosters[0];
     const viewingRoster = rosters.find(r => r.id === viewingRosterId) || activeRoster;
@@ -1088,6 +1425,39 @@ function App() {
                             sessions={activeRoster.sessions}
                             members={activeRoster.members}
                             deleteSession={deleteSession}
+                        />
+                    )}
+                </>
+            ) : isScorer ? (
+                <>
+                    <div className="roster-bar">
+                        <span className="roster-label">Roster</span>
+                        <span className="roster-name-static">{activeRoster?.name || "—"}</span>
+                    </div>
+                    <nav>
+                        <button className={tab === "match" ? "active" : ""} onClick={() => setTab("match")}>Match</button>
+                        <button className={tab === "members" ? "active" : ""} onClick={() => setTab("members")}>Members</button>
+                        <button className={tab === "history" ? "active" : ""} onClick={() => setTab("history")}>History</button>
+                    </nav>
+                    {tab === "match" && (
+                        <MatchView
+                            key={activeRoster?.id}
+                            activeRoster={activeRoster}
+                            patchActive={patchActive}
+                            showToast={setToast}
+                        />
+                    )}
+                    {tab === "members" && (
+                        <PublicMembersView
+                            key={activeRoster?.id}
+                            members={activeRoster?.members || []}
+                        />
+                    )}
+                    {tab === "history" && (
+                        <PublicHistoryView
+                            key={activeRoster?.id}
+                            sessions={activeRoster?.sessions || []}
+                            members={activeRoster?.members || []}
                         />
                     )}
                 </>
