@@ -18,8 +18,12 @@ db.enablePersistence({ synchronizeTabs: true }).catch(() => {});
 const googleProvider = new firebase.auth.GoogleAuthProvider();
 // Only this user can edit; everyone else sees a read-only view.
 const ADMIN_UID = "GiQwaYz7zGeG2bipauadUFO36NI3";
-// Scorer may update match scores and the timer, but cannot touch rosters/members.
-const SCORER_UID = "NhW9PukZFnVOmjnTOU5861Tfje03";
+// Scorers may update match scores and the timer, but cannot touch rosters/members.
+const SCORER_UIDS = new Set([
+    "NhW9PukZFnVOmjnTOU5861Tfje03",
+    "YqLY47sNTjeQPjjQ9W9OQFY6mcz1",
+]);
+const isScorerUid = (uid) => !!uid && SCORER_UIDS.has(uid);
 // ---------------------------------------------------------------------------
 
 const STORAGE_KEY = "volleyball-organizer-v3";
@@ -2990,7 +2994,7 @@ function App() {
     // Save: localStorage always; Firestore only when signed in AS admin (debounced).
     useEffect(() => {
         saveState({ rosters, activeRosterId, tournaments });
-        const canWrite = user?.uid === ADMIN_UID || user?.uid === SCORER_UID;
+        const canWrite = user?.uid === ADMIN_UID || isScorerUid(user?.uid);
         if (!canWrite || !cloudReady) {
             console.log("[cloud] skip write — gate failed", {
                 uid: user?.uid, canWrite, cloudReady,
@@ -3027,7 +3031,7 @@ function App() {
     const signOut = () => auth.signOut();
 
     const isAdmin = user?.uid === ADMIN_UID;
-    const isScorer = user?.uid === SCORER_UID;
+    const isScorer = isScorerUid(user?.uid);
 
     // Keep the sub-tab valid for the current role. Tournament is a top-level
     // section now, not a sub-tab, so it's not in these lists.
@@ -3194,8 +3198,7 @@ function App() {
                     <div className="auth-chip">
                         {user ? (
                             <>
-                                {user.photoURL && <img src={user.photoURL} alt="" className="avatar" referrerPolicy="no-referrer" />}
-                                <span className="user-email" title={user.email}>{user.email}</span>
+                                {user.photoURL && <img src={user.photoURL} alt="" className="avatar" referrerPolicy="no-referrer" title={user.email} />}
                                 <button className="btn btn-secondary" onClick={signOut}>Sign out</button>
                             </>
                         ) : (
