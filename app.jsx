@@ -108,6 +108,7 @@ const normalizeState = (parsed) => {
             members: Array.isArray(r.members) ? r.members : [],
             sessions: Array.isArray(r.sessions) ? r.sessions : [],
             currentSession: r.currentSession || null,
+            tournaments: Array.isArray(r.tournaments) ? r.tournaments.map(normalizeTournament) : [],
         }));
         const activeRosterId = rosters.some(r => r.id === parsed.activeRosterId)
             ? parsed.activeRosterId
@@ -192,6 +193,84 @@ const nextFriday = () => {
     d.setDate(d.getDate() + offset);
     return d.toISOString().slice(0, 10);
 };
+
+const todayISO = () => new Date().toISOString().slice(0, 10);
+
+const makeTournament = (name, date) => ({
+    id: uid(),
+    name,
+    date: date || todayISO(),
+    teams: [],
+    matches: [],
+    activeMatch: null,
+    endedAt: null,
+    createdAt: new Date().toISOString(),
+});
+
+// Distinct colors for tournament teams, cycled by team index. Enough for
+// up to 12 teams before repeating.
+const TOURNAMENT_TEAM_COLORS = [
+    "#FF4D6D", // red
+    "#00F0FF", // cyan
+    "#FFC107", // amber
+    "#39FF14", // neon green
+    "#A855F7", // purple
+    "#FB923C", // orange
+    "#EC4899", // pink
+    "#10B981", // emerald
+    "#FACC15", // yellow
+    "#60A5FA", // blue
+    "#F43F5E", // rose
+    "#14B8A6", // teal
+];
+const teamColor = (i) => TOURNAMENT_TEAM_COLORS[((i % TOURNAMENT_TEAM_COLORS.length) + TOURNAMENT_TEAM_COLORS.length) % TOURNAMENT_TEAM_COLORS.length];
+
+// Round-robin standings. 2 pts per win, 1 per draw, 0 per loss.
+// Tiebreakers: points, point diff, points for.
+const computeStandings = (teams, matches) => {
+    const stats = teams.map(t => ({
+        team: t,
+        played: 0, wins: 0, draws: 0, losses: 0,
+        pointsFor: 0, pointsAgainst: 0, pts: 0,
+    }));
+    const byId = Object.fromEntries(stats.map(s => [s.team.id, s]));
+    (matches || []).forEach(m => {
+        const a = byId[m.teamAId];
+        const b = byId[m.teamBId];
+        if (!a || !b) return;
+        const sA = m.scoreA || 0;
+        const sB = m.scoreB || 0;
+        a.played++; b.played++;
+        a.pointsFor += sA; a.pointsAgainst += sB;
+        b.pointsFor += sB; b.pointsAgainst += sA;
+        if (sA > sB) { a.wins++; b.losses++; a.pts += 2; }
+        else if (sB > sA) { b.wins++; a.losses++; b.pts += 2; }
+        else { a.draws++; b.draws++; a.pts++; b.pts++; }
+    });
+    return [...stats].sort((x, y) => {
+        if (y.pts !== x.pts) return y.pts - x.pts;
+        const xDiff = x.pointsFor - x.pointsAgainst;
+        const yDiff = y.pointsFor - y.pointsAgainst;
+        if (yDiff !== xDiff) return yDiff - xDiff;
+        return y.pointsFor - x.pointsFor;
+    });
+};
+
+const normalizeTournament = (t) => ({
+    id: t.id || uid(),
+    name: t.name || "Tournament",
+    date: t.date || todayISO(),
+    teams: Array.isArray(t.teams) ? t.teams.map(team => ({
+        id: team.id || uid(),
+        name: team.name || "Team",
+        // v1 used playerIds (roster refs); v2+ uses free-text players.
+        players: Array.isArray(team.players) ? team.players.filter(p => typeof p === "string") : [],
+    })) : [],
+    matches: Array.isArray(t.matches) ? t.matches : [],
+    activeMatch: t.activeMatch || null,
+    endedAt: t.endedAt || null,
+    createdAt: t.createdAt || new Date().toISOString(),
+});
 
 const teamBreakdown = (team) => {
     const counts = { 1: 0, 2: 0, 3: 0 };
@@ -1098,6 +1177,903 @@ function PublicHistoryView({ sessions, members }) {
     );
 }
 
+function StandingsTable({ standings, teams }) {
+    if (standings.length === 0) {
+        return <div className="empty">No teams yet — add teams to see the standings.</div>;
+    }
+    return (
+        <div className="standings-wrap">
+            <table className="standings">
+                <thead>
+                    <tr>
+                        <th className="pos">#</th>
+                        <th className="team-col">Team</th>
+                        <th>P</th>
+                        <th>W</th>
+                        <th>D</th>
+                        <th>L</th>
+                        <th>PF</th>
+                        <th>PA</th>
+                        <th className="pd-col">PD</th>
+                        <th className="pts-col">Pts</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {standings.map((s, i) => {
+                        const pd = s.pointsFor - s.pointsAgainst;
+                        const originalIdx = teams.findIndex(t => t.id === s.team.id);
+                        const color = teamColor(originalIdx >= 0 ? originalIdx : i);
+                        return (
+                            <tr key={s.team.id} className={i === 0 && s.played > 0 ? "leader" : ""}>
+                                <td className="pos">{i + 1}</td>
+                                <td className="team-col">
+                                    <span className="team-dot" style={{ background: color }}></span>
+                                    {s.team.name}
+                                </td>
+                                <td>{s.played}</td>
+                                <td>{s.wins}</td>
+                                <td>{s.draws}</td>
+                                <td>{s.losses}</td>
+                                <td>{s.pointsFor}</td>
+                                <td>{s.pointsAgainst}</td>
+                                <td className={`pd-col ${pd > 0 ? "pd-pos" : pd < 0 ? "pd-neg" : ""}`}>
+                                    {pd > 0 ? `+${pd}` : pd}
+                                </td>
+                                <td className="pts-col">{s.pts}</td>
+                            </tr>
+                        );
+                    })}
+                </tbody>
+            </table>
+            <div className="standings-legend">
+                P played · W wins · D draws · L losses · PF for · PA against · PD diff · Pts = 2·W + D
+            </div>
+        </div>
+    );
+}
+
+function TeamsManagerCard({ tournament, patchTournament, disabled, showToast }) {
+    const [newTeamName, setNewTeamName] = useState("");
+    const [editingTeamId, setEditingTeamId] = useState(null);
+    const [editingName, setEditingName] = useState("");
+    const [bulkText, setBulkText] = useState("");
+    const [playerDrafts, setPlayerDrafts] = useState({});
+    const [bulkPlayerDrafts, setBulkPlayerDrafts] = useState({});
+
+    const addTeam = () => {
+        if (disabled) return;
+        const name = newTeamName.trim();
+        if (!name) return;
+        if (tournament.teams.some(t => t.name.toLowerCase() === name.toLowerCase())) {
+            alert("A team with that name already exists.");
+            return;
+        }
+        patchTournament(t => ({
+            ...t,
+            teams: [...(t.teams || []), { id: uid(), name, players: [] }],
+        }));
+        setNewTeamName("");
+    };
+
+    // Each line = one team. Format: "Team Name: Player1, Player2, ..." (players optional).
+    const addTeamsBulk = () => {
+        if (disabled) return;
+        const lines = bulkText.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+        if (!lines.length) return;
+        const existing = new Set(tournament.teams.map(t => t.name.toLowerCase()));
+        const toAdd = [];
+        lines.forEach(line => {
+            const colon = line.indexOf(":");
+            const teamName = (colon >= 0 ? line.slice(0, colon) : line).trim();
+            if (!teamName) return;
+            const key = teamName.toLowerCase();
+            if (existing.has(key)) return;
+            existing.add(key);
+            const playerBlob = colon >= 0 ? line.slice(colon + 1) : "";
+            const players = playerBlob
+                .split(",").map(s => s.trim()).filter(Boolean);
+            toAdd.push({ id: uid(), name: teamName, players });
+        });
+        if (!toAdd.length) {
+            alert("No new teams to add — check for duplicates or empty names.");
+            return;
+        }
+        patchTournament(t => ({ ...t, teams: [...(t.teams || []), ...toAdd] }));
+        setBulkText("");
+        showToast?.(`Added ${toAdd.length} team${toAdd.length === 1 ? "" : "s"}`);
+    };
+
+    const commitRename = (teamId) => {
+        const name = editingName.trim();
+        setEditingTeamId(null);
+        if (!name) return;
+        const existing = tournament.teams.find(t => t.id === teamId);
+        if (!existing || name === existing.name) return;
+        if (tournament.teams.some(t => t.id !== teamId && t.name.toLowerCase() === name.toLowerCase())) {
+            alert("A team with that name already exists.");
+            return;
+        }
+        patchTournament(t => ({
+            ...t,
+            teams: t.teams.map(x => x.id === teamId ? { ...x, name } : x),
+        }));
+    };
+
+    const deleteTeam = (teamId) => {
+        if (disabled) return;
+        const team = tournament.teams.find(t => t.id === teamId);
+        if (!team) return;
+        const hasMatches = (tournament.matches || []).some(m => m.teamAId === teamId || m.teamBId === teamId);
+        if (hasMatches) {
+            if (!confirm(`"${team.name}" has recorded matches. Delete the team AND its matches?`)) return;
+            patchTournament(t => ({
+                ...t,
+                teams: t.teams.filter(x => x.id !== teamId),
+                matches: (t.matches || []).filter(m => m.teamAId !== teamId && m.teamBId !== teamId),
+            }));
+        } else {
+            if (!confirm(`Delete team "${team.name}"?`)) return;
+            patchTournament(t => ({
+                ...t,
+                teams: t.teams.filter(x => x.id !== teamId),
+            }));
+        }
+    };
+
+    const addPlayer = (teamId) => {
+        if (disabled) return;
+        const name = (playerDrafts[teamId] || "").trim();
+        if (!name) return;
+        patchTournament(t => ({
+            ...t,
+            teams: t.teams.map(x => x.id === teamId ? {
+                ...x,
+                players: x.players.includes(name) ? x.players : [...x.players, name],
+            } : x),
+        }));
+        setPlayerDrafts(d => ({ ...d, [teamId]: "" }));
+    };
+
+    const bulkAddPlayers = (teamId) => {
+        if (disabled) return;
+        const text = (bulkPlayerDrafts[teamId] || "").trim();
+        if (!text) return;
+        const names = text.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+        if (!names.length) return;
+        patchTournament(t => ({
+            ...t,
+            teams: t.teams.map(x => x.id === teamId ? {
+                ...x,
+                players: [...x.players, ...names.filter(n => !x.players.includes(n))],
+            } : x),
+        }));
+        setBulkPlayerDrafts(d => ({ ...d, [teamId]: "" }));
+    };
+
+    const removePlayer = (teamId, playerName) => {
+        if (disabled) return;
+        patchTournament(t => ({
+            ...t,
+            teams: t.teams.map(x => x.id === teamId ? {
+                ...x,
+                players: x.players.filter(p => p !== playerName),
+            } : x),
+        }));
+    };
+
+    return (
+        <div className="card">
+            <h2>Teams</h2>
+            <div className="row" style={{ marginBottom: "0.5rem" }}>
+                <input
+                    type="text"
+                    placeholder="Team name (e.g. Sharks)"
+                    value={newTeamName}
+                    onChange={e => setNewTeamName(e.target.value)}
+                    onKeyDown={e => e.key === "Enter" && addTeam()}
+                    disabled={disabled}
+                />
+                <button className="btn" onClick={addTeam} disabled={disabled}>Add Team</button>
+            </div>
+            <details className="bulk-teams-details">
+                <summary>Paste multiple teams at once</summary>
+                <div className="bulk-paste">
+                    <p className="help-text" style={{ marginTop: 0 }}>
+                        One team per line. Format: <code>Team Name: Player1, Player2, Player3</code>.
+                        Players are optional and can be added later.
+                    </p>
+                    <textarea
+                        value={bulkText}
+                        onChange={e => setBulkText(e.target.value)}
+                        placeholder={"Sharks: Alice, Bob, Carol\nWolves: Dave, Eve\nFoxes"}
+                        rows={5}
+                        disabled={disabled}
+                    />
+                    <button className="btn" onClick={addTeamsBulk} disabled={disabled}>Add teams</button>
+                </div>
+            </details>
+            {tournament.teams.length === 0 ? (
+                <div className="empty">No teams yet. Add one above or paste multiple at once.</div>
+            ) : (
+                <div className="tournament-teams">
+                    {tournament.teams.map((team, idx) => {
+                        const color = teamColor(idx);
+                        return (
+                            <div key={team.id} className="t-team" style={{ borderLeftColor: color }}>
+                                <div className="t-team-header">
+                                    {editingTeamId === team.id ? (
+                                        <input
+                                            className="t-team-name-input"
+                                            autoFocus
+                                            value={editingName}
+                                            onChange={e => setEditingName(e.target.value)}
+                                            onBlur={() => commitRename(team.id)}
+                                            onKeyDown={e => {
+                                                if (e.key === "Enter") commitRename(team.id);
+                                                if (e.key === "Escape") setEditingTeamId(null);
+                                            }}
+                                        />
+                                    ) : (
+                                        <span
+                                            className="t-team-name"
+                                            style={{ color }}
+                                            onClick={() => { if (!disabled) { setEditingTeamId(team.id); setEditingName(team.name); } }}
+                                            title={disabled ? "" : "Click to rename"}
+                                        >
+                                            {team.name}
+                                            <span className="t-team-count"> · {team.players.length}</span>
+                                        </span>
+                                    )}
+                                    <button className="icon-btn" onClick={() => deleteTeam(team.id)} title="Delete team" disabled={disabled}>✕</button>
+                                </div>
+                                {team.players.length > 0 && (
+                                    <div className="t-team-chips">
+                                        {team.players.map(p => (
+                                            <span key={p} className="t-chip">
+                                                {p}
+                                                {!disabled && (
+                                                    <button
+                                                        className="t-chip-x"
+                                                        onClick={() => removePlayer(team.id, p)}
+                                                        title={`Remove ${p}`}
+                                                        aria-label={`Remove ${p}`}
+                                                    >×</button>
+                                                )}
+                                            </span>
+                                        ))}
+                                    </div>
+                                )}
+                                <div className="row t-add-player">
+                                    <input
+                                        type="text"
+                                        placeholder="Add player name"
+                                        value={playerDrafts[team.id] || ""}
+                                        onChange={e => setPlayerDrafts(d => ({ ...d, [team.id]: e.target.value }))}
+                                        onKeyDown={e => e.key === "Enter" && addPlayer(team.id)}
+                                        disabled={disabled}
+                                    />
+                                    <button className="btn btn-secondary" onClick={() => addPlayer(team.id)} disabled={disabled}>Add</button>
+                                </div>
+                                <details className="t-bulk-players">
+                                    <summary>Paste players (one per line)</summary>
+                                    <textarea
+                                        value={bulkPlayerDrafts[team.id] || ""}
+                                        onChange={e => setBulkPlayerDrafts(d => ({ ...d, [team.id]: e.target.value }))}
+                                        rows={4}
+                                        placeholder={"Alice\nBob\nCarol"}
+                                        disabled={disabled}
+                                    />
+                                    <button className="btn btn-secondary" onClick={() => bulkAddPlayers(team.id)} disabled={disabled}>Add players</button>
+                                </details>
+                            </div>
+                        );
+                    })}
+                </div>
+            )}
+        </div>
+    );
+}
+
+function TournamentScoreboard({ tournament, patchTournament, showToast }) {
+    const teams = tournament.teams || [];
+
+    if (teams.length < 2) {
+        return (
+            <div className="card">
+                <h2>Record Match</h2>
+                <div className="empty">Add at least two teams to start recording matches.</div>
+            </div>
+        );
+    }
+
+    const am = tournament.activeMatch || {};
+    let teamAId = am.teamAId;
+    let teamBId = am.teamBId;
+    if (!teams.find(t => t.id === teamAId)) teamAId = teams[0].id;
+    if (!teams.find(t => t.id === teamBId) || teamBId === teamAId) {
+        teamBId = teams.find(t => t.id !== teamAId)?.id;
+    }
+    const scoreA = am.scoreA || 0;
+    const scoreB = am.scoreB || 0;
+
+    const [durationMin, setDurationMin] = useState(11);
+    const [elapsedSec, setElapsedSec] = useState(0);
+    const [running, setRunning] = useState(false);
+    const durationSec = Math.max(1, durationMin) * 60;
+
+    useEffect(() => {
+        if (!running) return;
+        const id = setInterval(() => {
+            setElapsedSec(e => {
+                if (e + 1 >= durationSec) {
+                    setRunning(false);
+                    playTimerAlarm();
+                    return durationSec;
+                }
+                return e + 1;
+            });
+        }, 1000);
+        return () => clearInterval(id);
+    }, [running, durationSec]);
+
+    const remaining = Math.max(0, durationSec - elapsedSec);
+    const mm = Math.floor(remaining / 60);
+    const ss = remaining % 60;
+    const expired = remaining === 0;
+
+    const setActive = (patch) => patchTournament(t => ({
+        ...t,
+        activeMatch: { ...(t.activeMatch || {}), ...patch },
+    }));
+
+    const pickTeam = (which, newId) => {
+        if (which === "A") {
+            const nextB = newId === teamBId ? teamAId : teamBId;
+            setActive({ teamAId: newId, teamBId: nextB, scoreA: 0, scoreB: 0 });
+        } else {
+            const nextA = newId === teamAId ? teamBId : teamAId;
+            setActive({ teamAId: nextA, teamBId: newId, scoreA: 0, scoreB: 0 });
+        }
+    };
+
+    const bump = (which, delta) => {
+        if (which === "A") setActive({ scoreA: Math.max(0, scoreA + delta), teamAId, teamBId });
+        else setActive({ scoreB: Math.max(0, scoreB + delta), teamAId, teamBId });
+    };
+
+    const resetScores = () => {
+        if (!confirm("Reset both scores to 0?")) return;
+        setActive({ scoreA: 0, scoreB: 0, teamAId, teamBId });
+    };
+
+    const resetTimer = () => { setElapsedSec(0); setRunning(false); };
+
+    const endMatch = () => {
+        if (scoreA === 0 && scoreB === 0) {
+            if (!confirm("Both scores are 0. Record this match anyway?")) return;
+        } else if (!confirm("End this match? Score will be saved to the tournament.")) {
+            return;
+        }
+        patchTournament(t => ({
+            ...t,
+            matches: [...(t.matches || []), {
+                id: uid(),
+                teamAId, teamBId,
+                scoreA, scoreB,
+                durationSec: elapsedSec,
+                endedAt: new Date().toISOString(),
+            }],
+            activeMatch: { ...(t.activeMatch || {}), teamAId, teamBId, scoreA: 0, scoreB: 0 },
+        }));
+        setElapsedSec(0);
+        setRunning(false);
+        showToast?.("Match recorded");
+    };
+
+    return (
+        <div className="card">
+            <h2>Record Match</h2>
+            <div className={`scoreboard-timer${expired ? " expired" : ""}`}>
+                <div className="timer-display">
+                    {mm}:{ss.toString().padStart(2, "0")}
+                </div>
+                <div className="timer-controls">
+                    <button
+                        className="btn"
+                        onClick={() => setRunning(r => !r)}
+                        disabled={expired && !running}
+                    >
+                        {running ? "Pause" : (elapsedSec > 0 ? "Resume" : "Start")}
+                    </button>
+                    <button className="btn btn-secondary" onClick={resetTimer}>Reset</button>
+                    <label className="duration-input">
+                        <span>Length</span>
+                        <input
+                            type="number"
+                            min="1"
+                            max="99"
+                            value={durationMin}
+                            onChange={e => setDurationMin(Math.max(1, Number(e.target.value) || 1))}
+                            disabled={running}
+                        />
+                        <span>min</span>
+                    </label>
+                </div>
+            </div>
+            <div className="scoreboard-teams scoreboard-2team">
+                <div
+                    className="scoreboard-team"
+                    style={{ "--team-color": teamColor(teams.findIndex(t => t.id === teamAId)) }}
+                >
+                    <select
+                        className="scoreboard-team-picker"
+                        value={teamAId}
+                        onChange={e => pickTeam("A", e.target.value)}
+                    >
+                        {teams.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
+                    </select>
+                    <div className="score-value">{scoreA}</div>
+                    <div className="score-controls">
+                        <button className="btn btn-secondary" onClick={() => bump("A", -1)} aria-label="Team A minus one">−</button>
+                        <button className="btn" onClick={() => bump("A", +1)} aria-label="Team A plus one">+</button>
+                    </div>
+                </div>
+                <div className="vs-label">VS</div>
+                <div
+                    className="scoreboard-team"
+                    style={{ "--team-color": teamColor(teams.findIndex(t => t.id === teamBId)) }}
+                >
+                    <select
+                        className="scoreboard-team-picker"
+                        value={teamBId}
+                        onChange={e => pickTeam("B", e.target.value)}
+                    >
+                        {teams.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
+                    </select>
+                    <div className="score-value">{scoreB}</div>
+                    <div className="score-controls">
+                        <button className="btn btn-secondary" onClick={() => bump("B", -1)} aria-label="Team B minus one">−</button>
+                        <button className="btn" onClick={() => bump("B", +1)} aria-label="Team B plus one">+</button>
+                    </div>
+                </div>
+            </div>
+            <div className="btn-row">
+                <button className="btn btn-secondary" onClick={resetScores}>Reset Scores</button>
+                <button className="btn" onClick={endMatch}>End Match</button>
+            </div>
+        </div>
+    );
+}
+
+function PublicTeamsCard({ tournament }) {
+    const teams = tournament.teams || [];
+    if (teams.length === 0) {
+        return (
+            <div className="card">
+                <h2>Teams</h2>
+                <div className="empty">No teams yet.</div>
+            </div>
+        );
+    }
+    return (
+        <div className="card">
+            <h2>Teams</h2>
+            <div className="tournament-teams">
+                {teams.map((team, idx) => {
+                    const color = teamColor(idx);
+                    return (
+                        <div key={team.id} className="t-team" style={{ borderLeftColor: color }}>
+                            <div className="t-team-header">
+                                <span className="t-team-name" style={{ color, cursor: "default" }}>
+                                    {team.name}
+                                    <span className="t-team-count"> · {team.players.length}</span>
+                                </span>
+                            </div>
+                            {team.players.length === 0 ? (
+                                <div className="help-text" style={{ marginTop: 0 }}>No players listed.</div>
+                            ) : (
+                                <div className="t-team-chips">
+                                    {team.players.map(p => (
+                                        <span key={p} className="t-chip">{p}</span>
+                                    ))}
+                                </div>
+                            )}
+                        </div>
+                    );
+                })}
+            </div>
+        </div>
+    );
+}
+
+// All round-robin pairings for the tournament's teams, with the recorded
+// result shown next to each pairing (or "Pending" when it hasn't been played).
+function FixturesCard({ tournament }) {
+    const teams = tournament.teams || [];
+    const matches = tournament.matches || [];
+    if (teams.length < 2) return null;
+
+    const pairings = [];
+    for (let i = 0; i < teams.length; i++) {
+        for (let j = i + 1; j < teams.length; j++) {
+            pairings.push({ a: teams[i], b: teams[j], aIdx: i, bIdx: j });
+        }
+    }
+
+    const pairKey = (idA, idB) => [idA, idB].sort().join("|");
+    const byPair = {};
+    matches.forEach(m => {
+        const k = pairKey(m.teamAId, m.teamBId);
+        (byPair[k] = byPair[k] || []).push(m);
+    });
+
+    const playedPairs = pairings.filter(p => (byPair[pairKey(p.a.id, p.b.id)] || []).length > 0).length;
+
+    return (
+        <div className="card">
+            <h2>Fixtures ({playedPairs}/{pairings.length})</h2>
+            <div className="fixture-list">
+                {pairings.map(({ a, b, aIdx, bIdx }) => {
+                    const played = byPair[pairKey(a.id, b.id)] || [];
+                    const colorA = teamColor(aIdx);
+                    const colorB = teamColor(bIdx);
+                    return (
+                        <div className={`fixture-row ${played.length > 0 ? "done" : "pending"}`} key={a.id + "-" + b.id}>
+                            <span className="fixture-team" style={{ color: colorA }}>{a.name}</span>
+                            <span className="fixture-vs">vs</span>
+                            <span className="fixture-team" style={{ color: colorB }}>{b.name}</span>
+                            <span className="fixture-result">
+                                {played.length === 0 ? (
+                                    <span className="fixture-pending">Pending</span>
+                                ) : (
+                                    played.map((m, i) => {
+                                        const sA = m.teamAId === a.id ? m.scoreA : m.scoreB;
+                                        const sB = m.teamAId === a.id ? m.scoreB : m.scoreA;
+                                        const aWon = sA > sB;
+                                        const bWon = sB > sA;
+                                        return (
+                                            <span key={m.id} className="fixture-score">
+                                                {i > 0 && <span className="fixture-sep">·</span>}
+                                                <span className={aWon ? "winner-side" : ""}>{sA}</span>
+                                                <span className="fixture-dash">–</span>
+                                                <span className={bWon ? "winner-side" : ""}>{sB}</span>
+                                            </span>
+                                        );
+                                    })
+                                )}
+                            </span>
+                        </div>
+                    );
+                })}
+            </div>
+        </div>
+    );
+}
+
+function TournamentHistoryCard({ tournaments, onOpen }) {
+    const ended = tournaments
+        .filter(t => t.endedAt)
+        .sort((a, b) => (b.endedAt || "").localeCompare(a.endedAt || ""));
+    if (ended.length === 0) return null;
+    return (
+        <div className="card">
+            <h2>Past Tournaments ({ended.length})</h2>
+            <div className="history-list">
+                {ended.map(t => {
+                    const standings = computeStandings(t.teams || [], t.matches || []);
+                    const winner = standings[0]?.played > 0 ? standings[0].team : null;
+                    return (
+                        <div className="history-row" key={t.id} onClick={() => onOpen?.(t.id)}>
+                            <div className="history-name">{t.name}</div>
+                            <div className="history-meta">
+                                {formatDate(t.date)}
+                                {" · "}{(t.teams || []).length} teams
+                                {" · "}{(t.matches || []).length} matches
+                            </div>
+                            <div className="history-winner">
+                                {winner ? <>🏆 <strong>{winner.name}</strong></> : <span className="muted">No winner</span>}
+                            </div>
+                        </div>
+                    );
+                })}
+            </div>
+        </div>
+    );
+}
+
+function TournamentMatchCard({ match, teams, index, canDelete, onDelete }) {
+    const aIdx = teams.findIndex(t => t.id === match.teamAId);
+    const bIdx = teams.findIndex(t => t.id === match.teamBId);
+    const a = aIdx >= 0 ? teams[aIdx] : null;
+    const b = bIdx >= 0 ? teams[bIdx] : null;
+    const colorA = aIdx >= 0 ? teamColor(aIdx) : "var(--border-strong)";
+    const colorB = bIdx >= 0 ? teamColor(bIdx) : "var(--border-strong)";
+    const aWin = match.scoreA > match.scoreB;
+    const bWin = match.scoreB > match.scoreA;
+    const mins = Math.floor((match.durationSec || 0) / 60);
+    const secs = (match.durationSec || 0) % 60;
+    const styleFor = (color, win) => win
+        ? { background: color, borderColor: color, borderLeftColor: color }
+        : { borderLeftColor: color };
+    return (
+        <div className="match-card tournament-match">
+            <div className="match-card-header">
+                <span className="match-card-num">Match {index + 1}</span>
+                <span className="match-card-time">
+                    {mins}:{secs.toString().padStart(2, "0")}
+                </span>
+                {canDelete && (
+                    <button className="icon-btn match-del" onClick={() => onDelete?.(match.id)} title="Delete match">✕</button>
+                )}
+            </div>
+            <div className="match-card-body">
+                <div className={`match-side${aWin ? " winner" : ""}`} style={styleFor(colorA, aWin)}>
+                    <span className="match-side-label">{a?.name || "—"}</span>
+                    <span className="match-side-score">{match.scoreA}</span>
+                </div>
+                <div className={`match-side${bWin ? " winner" : ""}`} style={styleFor(colorB, bWin)}>
+                    <span className="match-side-label">{b?.name || "—"}</span>
+                    <span className="match-side-score">{match.scoreB}</span>
+                </div>
+            </div>
+        </div>
+    );
+}
+
+function TournamentView({ activeRoster, patchActive, showToast, canManage, canScore }) {
+    const tournaments = activeRoster?.tournaments || [];
+    const [selectedId, setSelectedId] = useState(() => tournaments[tournaments.length - 1]?.id || null);
+
+    const activeTournament = tournaments.find(t => t.id === selectedId)
+        || tournaments[tournaments.length - 1]
+        || null;
+
+    useEffect(() => {
+        if (selectedId && !tournaments.some(t => t.id === selectedId)) {
+            setSelectedId(tournaments[tournaments.length - 1]?.id || null);
+        }
+    }, [tournaments.length, selectedId]);
+
+    const patchTournament = (updater) => {
+        if (!activeTournament) return;
+        patchActive(r => ({
+            ...r,
+            tournaments: (r.tournaments || []).map(t => t.id === activeTournament.id ? updater(t) : t),
+        }));
+    };
+
+    const createTournament = () => {
+        const name = (prompt("Tournament name:") || "").trim();
+        if (!name) return;
+        if (tournaments.some(t => t.name.toLowerCase() === name.toLowerCase())) {
+            alert("A tournament with that name already exists.");
+            return;
+        }
+        const t = makeTournament(name);
+        patchActive(r => ({ ...r, tournaments: [...(r.tournaments || []), t] }));
+        setSelectedId(t.id);
+        showToast?.(`Tournament "${name}" created`);
+    };
+
+    const renameTournament = () => {
+        if (!activeTournament) return;
+        const name = (prompt("Rename tournament:", activeTournament.name) || "").trim();
+        if (!name || name === activeTournament.name) return;
+        if (tournaments.some(t => t.id !== activeTournament.id && t.name.toLowerCase() === name.toLowerCase())) {
+            alert("A tournament with that name already exists.");
+            return;
+        }
+        patchTournament(t => ({ ...t, name }));
+    };
+
+    const deleteTournament = () => {
+        if (!activeTournament) return;
+        if (!confirm(`Delete tournament "${activeTournament.name}"? This can't be undone.`)) return;
+        patchActive(r => ({
+            ...r,
+            tournaments: (r.tournaments || []).filter(t => t.id !== activeTournament.id),
+        }));
+        showToast?.("Tournament deleted");
+    };
+
+    const setDate = (newDate) => patchTournament(t => ({ ...t, date: newDate }));
+
+    const endTournament = () => {
+        if (!activeTournament) return;
+        if (!confirm(`End "${activeTournament.name}"? No more matches can be recorded until it's reopened.`)) return;
+        patchTournament(t => ({ ...t, endedAt: new Date().toISOString() }));
+        showToast?.("Tournament ended");
+    };
+
+    const reopenTournament = () => {
+        if (!activeTournament) return;
+        if (!confirm("Reopen this tournament? Matches can be recorded again.")) return;
+        patchTournament(t => ({ ...t, endedAt: null }));
+        showToast?.("Tournament reopened");
+    };
+
+    const deleteMatch = (id) => {
+        if (!confirm("Delete this match?")) return;
+        patchTournament(t => ({ ...t, matches: (t.matches || []).filter(m => m.id !== id) }));
+    };
+
+    if (!activeTournament) {
+        return (
+            <div className="card">
+                <h2>Tournaments</h2>
+                <div className="empty">No tournaments yet.</div>
+                {canManage && (
+                    <div className="btn-row">
+                        <button className="btn" onClick={createTournament}>+ Create Tournament</button>
+                    </div>
+                )}
+            </div>
+        );
+    }
+
+    const teams = activeTournament.teams || [];
+    const matches = [...(activeTournament.matches || [])].reverse();
+    const played = (activeTournament.matches || []).length;
+    const standings = computeStandings(teams, activeTournament.matches || []);
+    const possibleMatches = teams.length >= 2 ? (teams.length * (teams.length - 1)) / 2 : 0;
+    const remainingMatches = Math.max(0, possibleMatches - played);
+    const ended = !!activeTournament.endedAt;
+    const champion = ended && standings[0] && standings[0].played > 0 ? standings[0].team : null;
+
+    return (
+        <div>
+            <div className="card tournament-top">
+                <div className="tournament-header">
+                    {tournaments.length > 1 ? (
+                        <select
+                            className="tournament-picker"
+                            value={activeTournament.id}
+                            onChange={e => setSelectedId(e.target.value)}
+                        >
+                            {tournaments.map(t => (
+                                <option key={t.id} value={t.id}>{t.name}</option>
+                            ))}
+                        </select>
+                    ) : (
+                        <h2 className="tournament-title">{activeTournament.name}</h2>
+                    )}
+                    {ended && <span className="ended-badge">Ended</span>}
+                </div>
+                <div className="tournament-date-row">
+                    {canManage ? (
+                        <input
+                            type="date"
+                            value={activeTournament.date || todayISO()}
+                            onChange={e => setDate(e.target.value)}
+                        />
+                    ) : (
+                        <span className="tournament-date">{formatDate(activeTournament.date)}</span>
+                    )}
+                </div>
+                {champion && (
+                    <div className="champion-banner">
+                        🏆 Winner: <strong>{champion.name}</strong>
+                    </div>
+                )}
+                <div className="tournament-stats">
+                    <div className="stat"><div className="num">{teams.length}</div><div className="label">Teams</div></div>
+                    <div className="stat"><div className="num">{played}</div><div className="label">Played</div></div>
+                    <div className="stat"><div className="num">{remainingMatches}</div><div className="label">Remaining</div></div>
+                </div>
+                {canManage && (
+                    <div className="btn-row">
+                        <button className="btn" onClick={createTournament}>+ New</button>
+                        <button className="btn btn-secondary" onClick={renameTournament}>Rename</button>
+                        {ended ? (
+                            <button className="btn btn-secondary" onClick={reopenTournament}>Reopen</button>
+                        ) : (
+                            <button className="btn btn-secondary" onClick={endTournament}>End Tournament</button>
+                        )}
+                        <button className="btn btn-danger" onClick={deleteTournament}>Delete</button>
+                    </div>
+                )}
+            </div>
+
+            <div className="card">
+                <h2>Standings</h2>
+                <StandingsTable standings={standings} teams={teams} />
+            </div>
+
+            {canManage ? (
+                <TeamsManagerCard
+                    tournament={activeTournament}
+                    patchTournament={patchTournament}
+                    disabled={ended}
+                    showToast={showToast}
+                />
+            ) : (
+                <PublicTeamsCard tournament={activeTournament} />
+            )}
+
+            <FixturesCard tournament={activeTournament} />
+
+            {!ended && (canManage || canScore) && (
+                <TournamentScoreboard
+                    tournament={activeTournament}
+                    patchTournament={patchTournament}
+                    showToast={showToast}
+                />
+            )}
+
+            <div className="card">
+                <h2>Matches Played ({(activeTournament.matches || []).length})</h2>
+                {matches.length === 0 ? (
+                    <div className="empty">No matches recorded yet.</div>
+                ) : (
+                    <div className="match-list">
+                        {matches.map((m, i) => (
+                            <TournamentMatchCard
+                                key={m.id || i}
+                                match={m}
+                                teams={teams}
+                                index={(activeTournament.matches || []).length - 1 - i}
+                                canDelete={canManage || canScore}
+                                onDelete={deleteMatch}
+                            />
+                        ))}
+                    </div>
+                )}
+            </div>
+
+            <TournamentHistoryCard
+                tournaments={tournaments.filter(t => t.id !== activeTournament.id)}
+                onOpen={(id) => setSelectedId(id)}
+            />
+        </div>
+    );
+}
+
+function RosterView({ rosters, activeRoster, setActiveRosterId, createRoster, renameRoster, deleteRoster, exportBackup, importBackup }) {
+    const sessionCount = activeRoster?.sessions?.length || 0;
+    const memberCount = activeRoster?.members?.length || 0;
+    const tournamentCount = activeRoster?.tournaments?.length || 0;
+    return (
+        <div>
+            <div className="card">
+                <h2>Rosters ({rosters.length})</h2>
+                <div className="row" style={{ flexWrap: "wrap", gap: "0.5rem" }}>
+                    <select
+                        value={activeRoster.id}
+                        onChange={e => setActiveRosterId(e.target.value)}
+                        style={{ flex: 1, minWidth: 180 }}
+                    >
+                        {rosters.map(r => (
+                            <option key={r.id} value={r.id}>{r.name}</option>
+                        ))}
+                    </select>
+                    <button className="btn" onClick={createRoster}>+ New</button>
+                    <button className="btn btn-secondary" onClick={renameRoster}>Rename</button>
+                    <button className="btn btn-danger" onClick={deleteRoster}>Delete</button>
+                    <button className="btn btn-secondary" onClick={exportBackup} title="Download all data as JSON">Backup to file</button>
+                    <button className="btn btn-secondary" onClick={importBackup} title="Restore from a backup file">Restore from file</button>
+                </div>
+            </div>
+            <div className="card">
+                <h2 style={{ marginBottom: "0.75rem" }}>{activeRoster.name}</h2>
+                <div className="stats-bar">
+                    <div className="stat">
+                        <div className="num">{memberCount}</div>
+                        <div className="label">Members</div>
+                    </div>
+                    <div className="stat">
+                        <div className="num">{sessionCount}</div>
+                        <div className="label">Sessions</div>
+                    </div>
+                    <div className="stat">
+                        <div className="num">{tournamentCount}</div>
+                        <div className="label">Tournaments</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    );
+}
+
 function App() {
     const stored = loadState();
     const initial = stored || {
@@ -1113,6 +2089,7 @@ function App() {
     // Non-admin viewers can switch which roster they're looking at without
     // affecting the admin's active roster. Null = follow admin's active roster.
     const [viewingRosterId, setViewingRosterId] = useState(null);
+    const [section, setSection] = useState("weekly");
     const [tab, setTab] = useState("week");
     const [toast, setToast] = useState(null);
     const [user, setUser] = useState(null);
@@ -1213,13 +2190,14 @@ function App() {
     const isAdmin = user?.uid === ADMIN_UID;
     const isScorer = user?.uid === SCORER_UID;
 
-    // Default-tab routing per role: admin→week, scorer→match, visitor→members.
+    // Keep the sub-tab valid for the current role. Tournament is a top-level
+    // section now, not a sub-tab, so it's not in these lists.
     useEffect(() => {
-        if (isAdmin) return;
-        if (isScorer) {
-            if (tab === "week") setTab("match");
-        } else {
-            if (tab === "week" || tab === "match") setTab("members");
+        const valid = isAdmin ? ["roster", "week", "members", "history"]
+                    : isScorer ? ["match", "members", "history"]
+                    : ["members", "history"];
+        if (!valid.includes(tab)) {
+            setTab(isAdmin ? "week" : isScorer ? "match" : "members");
         }
     }, [isAdmin, isScorer, tab]);
 
@@ -1256,6 +2234,7 @@ function App() {
             members: useBlank ? [] : seedRoster(),
             sessions: [],
             currentSession: null,
+            tournaments: [],
         };
         setRosters([...rosters, newRoster]);
         setActiveRosterId(newRoster.id);
@@ -1380,27 +2359,66 @@ function App() {
                 )}
             </header>
 
-            {isAdmin ? (
-                <>
-                    <div className="roster-bar">
-                        <span className="roster-label">Roster</span>
-                        <select value={activeRoster.id} onChange={e => setActiveRosterId(e.target.value)}>
+            <nav className="section-nav">
+                <button
+                    className={section === "weekly" ? "active" : ""}
+                    onClick={() => setSection("weekly")}
+                >Weekly / Daily Games</button>
+                <button
+                    className={section === "tournament" ? "active" : ""}
+                    onClick={() => setSection("tournament")}
+                >Tournament</button>
+            </nav>
+
+            {section === "weekly" && !isAdmin && (
+                <div className="roster-bar">
+                    <span className="roster-label">Roster</span>
+                    {isScorer ? (
+                        <span className="roster-name-static">{activeRoster?.name || "—"}</span>
+                    ) : rosters.length > 1 ? (
+                        <select
+                            value={viewingRoster?.id || ""}
+                            onChange={e => setViewingRosterId(e.target.value)}
+                        >
                             {rosters.map(r => (
                                 <option key={r.id} value={r.id}>{r.name}</option>
                             ))}
                         </select>
-                        <button onClick={createRoster} title="New roster">+ New</button>
-                        <button onClick={renameRoster} title="Rename this roster">Rename</button>
-                        <button className="danger" onClick={deleteRoster} title="Delete this roster">Delete</button>
-                        <span className="roster-divider" aria-hidden="true"></span>
-                        <button onClick={exportBackup} title="Download all data as a JSON file">Backup</button>
-                        <button onClick={importBackup} title="Restore from a backup file">Restore</button>
-                    </div>
+                    ) : (
+                        <span className="roster-name-static">{viewingRoster?.name || "—"}</span>
+                    )}
+                </div>
+            )}
+
+            {section === "tournament" ? (
+                <TournamentView
+                    key={(isAdmin || isScorer ? activeRoster?.id : viewingRoster?.id) + "-tournament"}
+                    activeRoster={isAdmin || isScorer ? activeRoster : viewingRoster}
+                    patchActive={isAdmin || isScorer ? patchActive : () => {}}
+                    showToast={setToast}
+                    canManage={isAdmin}
+                    canScore={isAdmin || isScorer}
+                />
+            ) : isAdmin ? (
+                <>
                     <nav>
+                        <button className={tab === "roster" ? "active" : ""} onClick={() => setTab("roster")}>Roster</button>
                         <button className={tab === "week" ? "active" : ""} onClick={() => setTab("week")}>This Week</button>
                         <button className={tab === "members" ? "active" : ""} onClick={() => setTab("members")}>Members</button>
                         <button className={tab === "history" ? "active" : ""} onClick={() => setTab("history")}>History</button>
                     </nav>
+                    {tab === "roster" && (
+                        <RosterView
+                            rosters={rosters}
+                            activeRoster={activeRoster}
+                            setActiveRosterId={setActiveRosterId}
+                            createRoster={createRoster}
+                            renameRoster={renameRoster}
+                            deleteRoster={deleteRoster}
+                            exportBackup={exportBackup}
+                            importBackup={importBackup}
+                        />
+                    )}
                     {tab === "week" && (
                         <ThisWeekView
                             key={activeRoster.id}
@@ -1430,10 +2448,6 @@ function App() {
                 </>
             ) : isScorer ? (
                 <>
-                    <div className="roster-bar">
-                        <span className="roster-label">Roster</span>
-                        <span className="roster-name-static">{activeRoster?.name || "—"}</span>
-                    </div>
                     <nav>
                         <button className={tab === "match" ? "active" : ""} onClick={() => setTab("match")}>Match</button>
                         <button className={tab === "members" ? "active" : ""} onClick={() => setTab("members")}>Members</button>
@@ -1463,21 +2477,6 @@ function App() {
                 </>
             ) : (
                 <>
-                    <div className="roster-bar">
-                        <span className="roster-label">Roster</span>
-                        {rosters.length > 1 ? (
-                            <select
-                                value={viewingRoster?.id || ""}
-                                onChange={e => setViewingRosterId(e.target.value)}
-                            >
-                                {rosters.map(r => (
-                                    <option key={r.id} value={r.id}>{r.name}</option>
-                                ))}
-                            </select>
-                        ) : (
-                            <span className="roster-name-static">{viewingRoster?.name || "—"}</span>
-                        )}
-                    </div>
                     <nav>
                         <button className={tab === "members" ? "active" : ""} onClick={() => setTab("members")}>Members</button>
                         <button className={tab === "history" ? "active" : ""} onClick={() => setTab("history")}>History</button>
