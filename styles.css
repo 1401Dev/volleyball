@@ -861,28 +861,22 @@ button.icon-btn:hover { background: var(--surface-2); color: var(--danger); }
     text-align: right;
 }
 .match-side.winner.team-1 {
-    background: rgba(255, 77, 109, 0.12);
-    border-color: rgba(255, 77, 109, 0.4);
-    border-left-color: var(--team-a);
+    background: var(--team-a);
+    border-color: var(--team-a);
 }
 .match-side.winner.team-2 {
-    background: rgba(0, 240, 255, 0.1);
-    border-color: rgba(0, 240, 255, 0.4);
-    border-left-color: var(--team-b);
+    background: var(--team-b);
+    border-color: var(--team-b);
 }
 .match-side.winner.team-3 {
-    background: rgba(255, 193, 7, 0.12);
-    border-color: rgba(255, 193, 7, 0.4);
-    border-left-color: var(--team-c);
+    background: var(--team-c);
+    border-color: var(--team-c);
 }
-.match-side.winner.team-1 .match-side-label,
-.match-side.winner.team-1 .match-side-score { color: var(--team-a); }
-.match-side.winner.team-2 .match-side-label,
-.match-side.winner.team-2 .match-side-score { color: var(--team-b); }
-.match-side.winner.team-3 .match-side-label,
-.match-side.winner.team-3 .match-side-score { color: var(--team-c); }
 .match-side.winner .match-side-label,
-.match-side.winner .match-side-score { font-weight: 700; }
+.match-side.winner .match-side-score {
+    color: #0a1420;
+    font-weight: 800;
+}
 
 @media (max-width: 600px) {
     .app { padding: 0.75rem; }
