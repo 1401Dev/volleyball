@@ -66,6 +66,37 @@ const makeRoster = (name, members = []) => ({
     currentSession: null,
 });
 
+// Firestore rejects nested arrays, so wrap each team as { players: [...] } on
+// write and unwrap on read. Local state always uses the raw `teams: [[],[]]` shape.
+const encodeSessionForCloud = (s) => {
+    if (!s || !Array.isArray(s.teams)) return s;
+    return { ...s, teams: s.teams.map(team => ({ players: team })) };
+};
+const decodeSessionFromCloud = (s) => {
+    if (!s || !Array.isArray(s.teams)) return s;
+    const first = s.teams[0];
+    if (first && typeof first === "object" && !Array.isArray(first) && Array.isArray(first.players)) {
+        return { ...s, teams: s.teams.map(w => Array.isArray(w?.players) ? w.players : []) };
+    }
+    return s;
+};
+const encodeStateForCloud = (state) => ({
+    ...state,
+    rosters: state.rosters.map(r => ({
+        ...r,
+        currentSession: encodeSessionForCloud(r.currentSession),
+        sessions: (r.sessions || []).map(encodeSessionForCloud),
+    })),
+});
+const decodeStateFromCloud = (state) => ({
+    ...state,
+    rosters: state.rosters.map(r => ({
+        ...r,
+        currentSession: decodeSessionFromCloud(r.currentSession),
+        sessions: (r.sessions || []).map(decodeSessionFromCloud),
+    })),
+});
+
 const normalizeState = (parsed) => {
     if (!parsed || typeof parsed !== "object") return null;
     if (Array.isArray(parsed.rosters) && parsed.rosters.length > 0) {
@@ -773,34 +804,70 @@ function App() {
     useEffect(() => {
         const docRef = db.collection("users").doc(ADMIN_UID);
         const unsub = docRef.onSnapshot(snap => {
+            console.log("[cloud] snapshot", {
+                exists: snap.exists,
+                fromCache: snap.metadata.fromCache,
+                hasPendingWrites: snap.metadata.hasPendingWrites,
+            });
             const data = snap.exists ? snap.data() : null;
             if (!data?.state) { setCloudReady(true); return; }
-            const normalized = normalizeState(data.state);
+            const decoded = decodeStateFromCloud(data.state);
+            const normalized = normalizeState(decoded);
             if (!normalized) { setCloudReady(true); return; }
             const serialized = JSON.stringify(normalized);
             if (serialized !== lastSyncedRef.current) {
+                console.log("[cloud] applying snapshot. activeRosterId:",
+                    normalized.activeRosterId,
+                    "rosters:",
+                    normalized.rosters.map(r => ({
+                        name: r.name, id: r.id,
+                        members: r.members?.length ?? 0,
+                        sessions: r.sessions?.length ?? 0,
+                    })));
                 lastSyncedRef.current = serialized;
                 setRosters(normalized.rosters);
                 setActiveRosterId(normalized.activeRosterId);
+            } else {
+                console.log("[cloud] snapshot matches local — ignored");
             }
             setCloudReady(true);
-        }, err => console.error("Firestore sync error:", err));
+        }, err => {
+            console.error("[cloud] sync error:", err);
+            setToast("Cloud sync error: " + (err?.message || err));
+        });
         return unsub;
     }, []);
 
     // Save: localStorage always; Firestore only when signed in AS admin (debounced).
     useEffect(() => {
         saveState({ rosters, activeRosterId });
-        if (user?.uid !== ADMIN_UID || !cloudReady) return;
+        if (user?.uid !== ADMIN_UID || !cloudReady) {
+            console.log("[cloud] skip write — gate failed", {
+                uid: user?.uid, isAdmin: user?.uid === ADMIN_UID, cloudReady,
+            });
+            return;
+        }
         const payload = { rosters, activeRosterId };
         const serialized = JSON.stringify(payload);
-        if (serialized === lastSyncedRef.current) return;
+        if (serialized === lastSyncedRef.current) {
+            console.log("[cloud] skip write — unchanged");
+            return;
+        }
+        console.log("[cloud] write scheduled — sessions in roster[0]:",
+            payload.rosters.find(r => r.id === payload.activeRosterId)?.sessions?.length);
         const t = setTimeout(() => {
             lastSyncedRef.current = serialized;
+            const encoded = encodeStateForCloud(payload);
+            console.log("[cloud] writing now", encoded);
             db.collection("users").doc(ADMIN_UID).set({
-                state: payload,
+                state: encoded,
                 updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
-            }, { merge: true }).catch(err => console.error("Firestore save error:", err));
+            }, { merge: true })
+                .then(() => console.log("[cloud] write OK"))
+                .catch(err => {
+                    console.error("[cloud] write FAILED:", err);
+                    setToast("Save failed: " + (err?.message || err));
+                });
         }, 500);
         return () => clearTimeout(t);
     }, [rosters, activeRosterId, user, cloudReady]);
