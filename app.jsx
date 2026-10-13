@@ -4197,6 +4197,19 @@ function TournamentLiveCard({ tournament, slots, onViewTournament, onDismissSlot
         }
     }, [slots.length, activeIdx]);
 
+    // On first mount of the carousel (and when the slot count changes while it
+    // is open), snap the scroll position to the active slide without animation.
+    // Without this, scrollLeft=0 would land the carousel in the leading spacer
+    // and leave slide 0 off-center on the left edge.
+    React.useLayoutEffect(() => {
+        if (!expanded || !multi) return;
+        const el = carouselRef.current;
+        if (!el) return;
+        const step = el.querySelector(".live-slide")?.offsetWidth || 0;
+        if (!step) return;
+        el.scrollTo({ left: activeIdx * step, behavior: "instant" });
+    }, [expanded, multi, slots.length]);
+
     // Pause/Resume toggle for a specific live slot. Captures the current
     // elapsedMs into timerAccumMs when pausing so the clock doesn't jump.
     const toggleSlotTimer = (slotKey, am) => {
@@ -4211,17 +4224,29 @@ function TournamentLiveCard({ tournament, slots, onViewTournament, onDismissSlot
         }
     };
 
+    // Snap step = width of one .live-slide element, measured from the DOM so we
+    // don't have to hardcode the CSS percentage. The spacers are not .live-slide
+    // and are correctly skipped by this query.
+    const getSlideStep = (el) => {
+        if (!el) return 0;
+        const slide = el.querySelector(".live-slide");
+        return slide?.offsetWidth || 0;
+    };
     const scrollToSlide = (idx) => {
         const el = carouselRef.current;
         if (!el) return;
-        el.scrollTo({ left: idx * el.clientWidth, behavior: "smooth" });
+        const step = getSlideStep(el);
+        if (!step) return;
+        el.scrollTo({ left: idx * step, behavior: "smooth" });
         setActiveIdx(idx);
     };
 
     const onCarouselScroll = () => {
         const el = carouselRef.current;
         if (!el) return;
-        const idx = Math.round(el.scrollLeft / Math.max(1, el.clientWidth));
+        const step = getSlideStep(el);
+        if (!step) return;
+        const idx = Math.round(el.scrollLeft / step);
         if (idx !== activeIdx) setActiveIdx(idx);
     };
 
@@ -4323,17 +4348,21 @@ function TournamentLiveCard({ tournament, slots, onViewTournament, onDismissSlot
                         aria-roledescription="carousel"
                         aria-label={`${slots.length} live matches — swipe to switch`}
                     >
+                        <div className="live-slide-spacer" aria-hidden="true" />
                         {slots.map((slot, i) => (
                             <div
                                 key={slot.slotKey}
-                                className="live-slide"
+                                className={`live-slide${i === activeIdx ? " is-active" : ""}`}
                                 role="group"
                                 aria-roledescription="slide"
                                 aria-label={`Match ${i + 1} of ${slots.length}`}
                             >
-                                {renderSlot(slot)}
+                                <div className="live-slide-inner">
+                                    {renderSlot(slot)}
+                                </div>
                             </div>
                         ))}
+                        <div className="live-slide-spacer" aria-hidden="true" />
                     </div>
                     <div className="live-pager">
                         <button

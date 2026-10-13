@@ -2256,9 +2256,11 @@ nav.tournament-tabs button.active {
     margin-top: 0.5rem;
     flex-wrap: wrap;
 }
-/* Apple-Sports-style swipe pager for a tournament with 2+ courts live at once.
-   The row scroll-snaps horizontally so a touch swipe always lands on exactly
-   one match; dots and arrows below drive it on desktop. */
+/* Apple-Sports-style peek-view swipe pager for a tournament with 2+ courts
+   live at once. The centered slide is at full scale (80% of the carousel
+   width) while the previous and next matches peek through on either side at
+   reduced scale/opacity. Horizontal scroll-snap-align: center lands a touch
+   swipe on exactly one card. Dots and arrows below drive it on desktop. */
 .live-carousel {
     display: flex;
     overflow-x: auto;
@@ -2266,13 +2268,39 @@ nav.tournament-tabs button.active {
     scroll-behavior: smooth;
     -webkit-overflow-scrolling: touch;
     scrollbar-width: none;
+    padding-block: 0.75rem;
 }
 .live-carousel::-webkit-scrollbar { display: none; }
+/* Fixed-width spacers at the carousel ends create the room needed to center
+   the first and last slides (otherwise scroll-snap-align: center can't reach
+   them because scrollLeft can't go negative). Width equals the peek-strip
+   width (half of the unused space when a slide is 80% wide). */
+.live-slide-spacer {
+    flex: 0 0 10%;
+    scroll-snap-align: none;
+    pointer-events: none;
+}
 .live-slide {
-    flex: 0 0 100%;
+    flex: 0 0 80%;
     min-width: 0;
-    scroll-snap-align: start;
+    scroll-snap-align: center;
     scroll-snap-stop: always;
+    box-sizing: border-box;
+    padding: 0 0.4rem;
+    transform: scale(0.86);
+    opacity: 0.5;
+    transition: transform 0.28s ease, opacity 0.28s ease;
+}
+.live-slide.is-active {
+    transform: scale(1);
+    opacity: 1;
+}
+.live-slide-inner {
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 1rem;
+    height: 100%;
     box-sizing: border-box;
 }
 .live-pager {
