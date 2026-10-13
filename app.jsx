@@ -255,18 +255,18 @@ const makeTournament = (name, kind = TOURNAMENT_KIND_TEAMS, date, matchDurationM
 // up to 12 teams before repeating. Avoid the app's neon-green accent so the
 // winner highlight and other accented UI don't collide with team branding.
 const TOURNAMENT_TEAM_COLORS = [
-    "#FF4D6D", // red
-    "#00F0FF", // cyan
-    "#FFC107", // amber
-    "#A855F7", // purple
-    "#FB923C", // orange
-    "#EC4899", // pink
-    "#60A5FA", // blue
-    "#F43F5E", // rose
-    "#14B8A6", // teal
-    "#F472B6", // light pink
-    "#C084FC", // lavender
-    "#FDBA74", // peach
+    "#C2410C", // burnt orange
+    "#1D4ED8", // royal blue
+    "#047857", // emerald
+    "#B45309", // amber
+    "#0F766E", // teal
+    "#BE185D", // magenta
+    "#A16207", // goldenrod
+    "#0369A1", // steel blue
+    "#701A75", // royal purple
+    "#15803D", // forest
+    "#0E7490", // dark cyan
+    "#9F1239", // rose
 ];
 const teamColor = (i) => TOURNAMENT_TEAM_COLORS[((i % TOURNAMENT_TEAM_COLORS.length) + TOURNAMENT_TEAM_COLORS.length) % TOURNAMENT_TEAM_COLORS.length];
 
@@ -764,7 +764,7 @@ function Scoreboard({ session, teams, onUpdate, onEndMatch, onSaveSession, showT
     };
 
     // Weekly uses fixed team colors A/B/C.
-    const weeklyTeamColor = (idx) => ["#FF4D6D", "#00F0FF", "#FFC107"][idx % 3];
+    const weeklyTeamColor = (idx) => ["#C2410C", "#1D4ED8", "#047857"][idx % 3];
     const timeoutColor = timeoutTeam
         ? weeklyTeamColor(timeoutTeam === "A" ? teamIdxA : teamIdxB)
         : null;
@@ -3643,7 +3643,10 @@ function TournamentView({ tournaments, setTournaments, rosterTemplates, setRoste
     const tabs = [
         { key: "standings", label: "Standings" },
         ...(isRoster
-            ? [{ key: "roster", label: "Roster" }, { key: "teams", label: "Teams" }]
+            ? [
+                ...(canManage ? [{ key: "roster", label: "Roster" }] : []),
+                { key: "teams", label: "Teams" },
+            ]
             : [{ key: "teams", label: "Teams" }]),
         { key: "schedule", label: "Schedule" },
         ...(canRecord ? [{ key: "score", label: "Score" }] : []),
@@ -3716,9 +3719,6 @@ function TournamentView({ tournaments, setTournaments, rosterTemplates, setRoste
                         ) : (
                             <span className="tournament-date">{formatDate(activeTournament.date)}</span>
                         )}
-                        <span className={`kind-badge kind-${isRoster ? "roster" : "teams"}`}>
-                            {isRoster ? "Roster · AI teams" : "Preset teams"}
-                        </span>
                         {ended && <span className="ended-badge">Ended</span>}
                     </div>
                 </div>
@@ -4024,7 +4024,7 @@ function WeeklyLiveCard({ session, members, roster }) {
     const teamB = (teams[teamIdxB] || []).map(id => members.find(m => m.id === id)).filter(Boolean);
     const aWin = scoreA > scoreB;
     const bWin = scoreB > scoreA;
-    const WEEKLY_HEX = ["#FF4D6D", "#00F0FF", "#FFC107"];
+    const WEEKLY_HEX = ["#C2410C", "#1D4ED8", "#047857"];
     const colorA = WEEKLY_HEX[teamIdxA % 3];
     const colorB = WEEKLY_HEX[teamIdxB % 3];
 
