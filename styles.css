@@ -2341,6 +2341,53 @@ nav.tournament-tabs button.active {
     .live-pager-arrow { display: none; }
 }
 
+/* Apple-Sports-style swipe pager for the Teams tab when there are 2+ teams.
+   Peek-view layout: the centered team card is at full scale (80% of carousel
+   width) while the previous and next teams peek through on either side at
+   reduced scale/opacity. Horizontal scroll-snap-align: center lands a touch
+   swipe on exactly one card. Dots and arrows below drive it on desktop.
+   Reuses the .live-pager* control styling above. */
+.teams-carousel {
+    display: flex;
+    overflow-x: auto;
+    scroll-snap-type: x mandatory;
+    /* Deliberately NOT setting scroll-behavior: smooth here — the clone→real
+       seam jumps use scrollTo({behavior: "instant"}) in JS and must stay
+       instant, while arrow-click smooth scrolls set behavior: "smooth"
+       explicitly. A CSS default of smooth would turn every seam jump into a
+       visible rewind across the carousel. */
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+    margin-top: 1rem;
+    padding-block: 0.75rem;
+}
+.teams-carousel::-webkit-scrollbar { display: none; }
+/* Fixed-width spacers at the carousel ends create the room needed to center
+   the first and last real slides (otherwise scroll-snap-align: center can't
+   reach them because scrollLeft can't go negative). Their width equals the
+   peek-strip width (half of the unused space when a slide is 80% wide). */
+.team-slide-spacer {
+    flex: 0 0 10%;
+    scroll-snap-align: none;
+    pointer-events: none;
+}
+.team-slide {
+    flex: 0 0 80%;
+    min-width: 0;
+    scroll-snap-align: center;
+    scroll-snap-stop: always;
+    box-sizing: border-box;
+    padding: 0 0.4rem;
+    transform: scale(0.86);
+    opacity: 0.5;
+    transition: transform 0.28s ease, opacity 0.28s ease;
+}
+.team-slide.is-active {
+    transform: scale(1);
+    opacity: 1;
+}
+.team-slide > .team { height: 100%; }
+
 /* ------------------------------------------------------------------ */
 /* Compact scoring on mobile. Scorers tap +/- rapidly during a match, */
 /* so the whole Record Match card needs to fit on one phone viewport  */

@@ -1905,6 +1905,131 @@ function RosterTeamsCard({ tournament, patchTournament, disabled }) {
     const [dragOverTeam, setDragOverTeam] = useState(null);
     const [expandedRoundId, setExpandedRoundId] = useState(null);
 
+    // Apple-Sports-style swipe pager when there are 2+ teams. The row
+    // scroll-snaps horizontally so a touch swipe always lands on exactly one
+    // team; dots and arrows below drive it on desktop. To make it feel like an
+    // endless loop with peek-visible neighbours, we clone the last two teams
+    // at the head and the first two teams at the tail of the slide list, then
+    // jump across the seam once the scroll settles on a clone. Two clones on
+    // each side (not one) is deliberate: it keeps the previous/next peek
+    // content matching on both sides of the seam jump, so no new peek slide
+    // "flashes in" when we teleport. Visual order (N teams, 0-based idx):
+    //   [spacer, clone(N-2), clone(N-1), real0, real1, …, realN-1,
+    //    clone(0), clone(1), spacer]
+    // So the "real" first slide lives at visualIdx 2.
+    const teamsCarouselRef = useRef(null);
+    const scrollSettleTimerRef = useRef(null);
+    const suppressScrollRef = useRef(false);
+    const [teamsActiveIdx, setTeamsActiveIdx] = useState(0);
+    const useTeamsCarousel = teams.length >= 2;
+    useEffect(() => {
+        if (teamsActiveIdx > teams.length - 1) {
+            setTeamsActiveIdx(Math.max(0, teams.length - 1));
+        }
+    }, [teams.length, teamsActiveIdx]);
+    // Snap step = width of one .team-slide element, measured from the DOM so
+    // we don't have to hardcode the CSS percentage. The spacers are not
+    // .team-slide and are correctly skipped by this query.
+    const getTeamStep = (el) => {
+        if (!el) return 0;
+        const slide = el.querySelector(".team-slide");
+        return slide?.offsetWidth || 0;
+    };
+    // On first mount of the carousel, snap to the first real slide (past the
+    // leading spacer + clone) without animation so the user never sees the
+    // clone. useLayoutEffect fires before paint so there's no flash.
+    // Translate a visual slide index (0..N+3) into the real team index it
+    // represents. Head clones map to the last two teams; tail clones map to
+    // the first two teams.
+    const visualToRealIdx = (vi, total) => {
+        if (vi <= 0) return (total - 2 + total) % total;
+        if (vi === 1) return (total - 1 + total) % total;
+        if (vi >= total + 2 && vi < total + 3) return 0;
+        if (vi >= total + 3) return 1 % total;
+        return vi - 2;
+    };
+    // If the given visual index sits on a clone slide, return the visual
+    // index of its real twin (so we can teleport scrollLeft there seamlessly).
+    const cloneJumpTarget = (vi, total) => {
+        if (vi <= 1) return vi + total;
+        if (vi >= total + 2) return vi - total;
+        return null;
+    };
+    React.useLayoutEffect(() => {
+        if (!useTeamsCarousel) return;
+        const el = teamsCarouselRef.current;
+        if (!el) return;
+        const step = getTeamStep(el);
+        if (!step) return;
+        suppressScrollRef.current = true;
+        el.scrollTo({ left: (teamsActiveIdx + 2) * step, behavior: "instant" });
+        requestAnimationFrame(() => { suppressScrollRef.current = false; });
+    }, [useTeamsCarousel]);
+    // Scroll to a real team index. Picks a visual target that keeps the wrap
+    // animation moving in the "natural" direction (e.g. last → first slides
+    // forward across the first-tail-clone instead of rewinding through every
+    // team). Suppresses the scroll handler so intermediate frames of the
+    // smooth scroll don't fight with the active index we set here.
+    const scrollToTeamSlide = (idx) => {
+        const el = teamsCarouselRef.current;
+        if (!el) return;
+        const total = teams.length;
+        if (total === 0) return;
+        const step = getTeamStep(el);
+        if (!step) return;
+        const normalized = ((idx % total) + total) % total;
+        let targetVisual = normalized + 2;
+        if (teamsActiveIdx === total - 1 && normalized === 0) {
+            targetVisual = total + 2; // forward wrap via first tail clone
+        } else if (teamsActiveIdx === 0 && normalized === total - 1) {
+            targetVisual = 1; // backward wrap via second head clone
+        }
+        suppressScrollRef.current = true;
+        el.scrollTo({ left: targetVisual * step, behavior: "smooth" });
+        setTeamsActiveIdx(normalized);
+        if (scrollSettleTimerRef.current) clearTimeout(scrollSettleTimerRef.current);
+        scrollSettleTimerRef.current = setTimeout(() => {
+            const el2 = teamsCarouselRef.current;
+            if (!el2 || !el2.isConnected) { suppressScrollRef.current = false; return; }
+            const s2 = getTeamStep(el2);
+            if (!s2) { suppressScrollRef.current = false; return; }
+            const vi = Math.round(el2.scrollLeft / s2);
+            const jumpTo = cloneJumpTarget(vi, total);
+            if (jumpTo !== null) {
+                el2.scrollTo({ left: jumpTo * s2, behavior: "instant" });
+            }
+            requestAnimationFrame(() => { suppressScrollRef.current = false; });
+        }, 500);
+    };
+    // User-swipe path. The programmatic path above suppresses this handler
+    // during its smooth scroll, so intermediate scroll frames only reach here
+    // when the user is dragging — live-track the dot, then once scroll
+    // settles jump the clone to its real twin.
+    const onTeamsCarouselScroll = () => {
+        const el = teamsCarouselRef.current;
+        if (!el || !useTeamsCarousel) return;
+        if (suppressScrollRef.current) return;
+        const step = getTeamStep(el);
+        if (!step) return;
+        const vi = Math.round(el.scrollLeft / step);
+        const total = teams.length;
+        const realIdx = visualToRealIdx(vi, total);
+        if (realIdx !== teamsActiveIdx) setTeamsActiveIdx(realIdx);
+        if (scrollSettleTimerRef.current) clearTimeout(scrollSettleTimerRef.current);
+        scrollSettleTimerRef.current = setTimeout(() => {
+            if (!el.isConnected) return;
+            const s2 = getTeamStep(el);
+            if (!s2) return;
+            const vi2 = Math.round(el.scrollLeft / s2);
+            const jumpTo = cloneJumpTarget(vi2, total);
+            if (jumpTo !== null) {
+                suppressScrollRef.current = true;
+                el.scrollTo({ left: jumpTo * s2, behavior: "instant" });
+                requestAnimationFrame(() => { suppressScrollRef.current = false; });
+            }
+        }, 90);
+    };
+
     const movePlayerTo = (playerName, fromTeamIdx, toTeamIdx, toIdx) => {
         if (!canMovePlayers) return;
         patchTournament(t => {
@@ -1985,8 +2110,8 @@ function RosterTeamsCard({ tournament, patchTournament, disabled }) {
                                 <strong>{selectedPlayer.playerName}</strong> picked up — tap another player to swap, tap another team card to move to its end, or tap <strong>{selectedPlayer.playerName}</strong> again to cancel.
                             </div>
                         )}
-                        <div className="teams-grid">
-                            {teams.map((team, i) => {
+                        {(() => {
+                            const renderTeamCard = (team, i) => {
                                 const droppable = canMovePlayers && selectedPlayer != null && selectedPlayer.fromTeamIdx !== i;
                                 const dragOver = canMovePlayers && dragOverTeam === i;
                                 const teamHandlers = canMovePlayers ? {
@@ -2073,8 +2198,92 @@ function RosterTeamsCard({ tournament, patchTournament, disabled }) {
                                         </div>
                                     </div>
                                 );
-                            })}
-                        </div>
+                            };
+                            if (!useTeamsCarousel) {
+                                return (
+                                    <div className="teams-grid">
+                                        {teams.map((team, i) => renderTeamCard(team, i))}
+                                    </div>
+                                );
+                            }
+                            const total = teams.length;
+                            const headCloneIdxs = [(total - 2 + total) % total, (total - 1 + total) % total];
+                            const tailCloneIdxs = [0, 1 % total];
+                            return (
+                                <>
+                                    <div
+                                        className="teams-carousel"
+                                        ref={teamsCarouselRef}
+                                        onScroll={onTeamsCarouselScroll}
+                                        role="group"
+                                        aria-roledescription="carousel"
+                                        aria-label={`${total} teams — swipe to switch`}
+                                    >
+                                        <div className="team-slide-spacer" aria-hidden="true" />
+                                        {headCloneIdxs.map((realIdx, cloneSlot) => (
+                                            <div
+                                                key={`clone-head-${cloneSlot}-${teams[realIdx].id}`}
+                                                className={`team-slide team-slide-clone${teamsActiveIdx === realIdx ? " is-active" : ""}`}
+                                                aria-hidden="true"
+                                            >
+                                                {renderTeamCard(teams[realIdx], realIdx)}
+                                            </div>
+                                        ))}
+                                        {teams.map((team, i) => (
+                                            <div
+                                                key={team.id}
+                                                className={`team-slide${i === teamsActiveIdx ? " is-active" : ""}`}
+                                                role="group"
+                                                aria-roledescription="slide"
+                                                aria-label={`Team ${i + 1} of ${total}`}
+                                            >
+                                                {renderTeamCard(team, i)}
+                                            </div>
+                                        ))}
+                                        {tailCloneIdxs.map((realIdx, cloneSlot) => (
+                                            <div
+                                                key={`clone-tail-${cloneSlot}-${teams[realIdx].id}`}
+                                                className={`team-slide team-slide-clone${teamsActiveIdx === realIdx ? " is-active" : ""}`}
+                                                aria-hidden="true"
+                                            >
+                                                {renderTeamCard(teams[realIdx], realIdx)}
+                                            </div>
+                                        ))}
+                                        <div className="team-slide-spacer" aria-hidden="true" />
+                                    </div>
+                                    <div className="live-pager">
+                                        <button
+                                            type="button"
+                                            className="live-pager-arrow"
+                                            onClick={() => scrollToTeamSlide(teamsActiveIdx - 1)}
+                                            aria-label="Previous team"
+                                        >‹</button>
+                                        <div className="live-pager-dots" role="tablist">
+                                            {teams.map((_, i) => (
+                                                <button
+                                                    key={i}
+                                                    type="button"
+                                                    className={`live-pager-dot${i === teamsActiveIdx ? " active" : ""}`}
+                                                    onClick={() => scrollToTeamSlide(i)}
+                                                    role="tab"
+                                                    aria-selected={i === teamsActiveIdx}
+                                                    aria-label={`Team ${i + 1}`}
+                                                />
+                                            ))}
+                                        </div>
+                                        <button
+                                            type="button"
+                                            className="live-pager-arrow"
+                                            onClick={() => scrollToTeamSlide(teamsActiveIdx + 1)}
+                                            aria-label="Next team"
+                                        >›</button>
+                                    </div>
+                                    <div className="live-pager-label">
+                                        {teams[teamsActiveIdx]?.name || `Team ${teamsActiveIdx + 1}`} · {teamsActiveIdx + 1} of {teams.length}
+                                    </div>
+                                </>
+                            );
+                        })()}
                         {canMovePlayers ? (
                             <p className="help-text">
                                 Drag a player onto another player to place them at that exact spot (works within the same team too). Drop on empty team space to add to the end. On mobile: tap a player, then tap another player to swap, or tap a team card to move to its end.
