@@ -41,6 +41,12 @@ body {
     letter-spacing: 0.005em;
 }
 .app { max-width: 960px; margin: 0 auto; padding: 1.25rem 1rem 3rem; }
+.sticky-top {
+    position: sticky;
+    top: 0;
+    z-index: 30;
+    background: var(--bg);
+}
 header {
     display: flex;
     align-items: center;
@@ -160,7 +166,7 @@ nav button.active::after {
     left: 0;
     right: 0;
     bottom: 0;
-    height: 3px;
+    height: 1px;
     background: var(--accent);
 }
 .card {
@@ -1393,11 +1399,17 @@ nav.section-nav button.active::after { display: none; }
 .tournament-match .match-del:hover { opacity: 1; color: var(--danger); }
 
 .duration-grid {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-start;
     gap: 0.6rem;
     margin: 0.75rem 0 1rem;
     align-items: center;
+}
+.duration-row-break {
+    flex-basis: 100%;
+    width: 0;
+    height: 0;
 }
 .pre-match-settings {
     padding: 0.75rem 0.9rem;
@@ -1408,7 +1420,8 @@ nav.section-nav button.active::after { display: none; }
 .duration-field {
     display: flex;
     align-items: center;
-    gap: 0.4rem;
+    justify-content: center;
+    gap: 0.5rem;
     padding: 0.4rem 0.6rem;
     background: var(--surface);
     border: 1px solid var(--border);
@@ -1419,6 +1432,12 @@ nav.section-nav button.active::after { display: none; }
     letter-spacing: 0.08em;
     color: var(--text-dim);
     font-weight: 700;
+}
+/* On wide fields (Name/Date) the stretchy text/date input fills remaining
+   room so there's no dead space inside the row. */
+.duration-field-wide input[type="text"],
+.duration-field-wide input[type="date"] {
+    flex: 1;
 }
 .duration-field input {
     width: 56px;
@@ -1435,11 +1454,20 @@ nav.section-nav button.active::after { display: none; }
     opacity: 0.6;
     cursor: not-allowed;
 }
+.duration-field input[type="date"] {
+    width: auto;
+    flex: 0 0 auto;
+}
+.duration-field-wide {
+    flex: 1 1 60%;
+    grid-column: 1 / -1;
+}
 .duration-field .duration-unit {
     font-size: 0.7rem;
     color: var(--text-dim);
 }
 .duration-help {
+    flex: 1 1 100%;
     grid-column: 1 / -1;
     margin: 0;
     font-size: 0.78rem;
@@ -1624,6 +1652,88 @@ nav.section-nav button.active::after { display: none; }
     border-radius: 999px;
     vertical-align: middle;
 }
+
+/* ------------------------------------------------------------------ */
+/* Schedule tab (admin + viewer)                                       */
+/* ------------------------------------------------------------------ */
+.schedule-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    margin-top: 0.5rem;
+}
+.schedule-row {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    padding: 0.75rem 0.9rem;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+}
+.schedule-row.pending { opacity: 0.9; }
+.schedule-row.done { border-color: var(--border-strong); }
+.schedule-row-main {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    flex-wrap: wrap;
+}
+.schedule-pos {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 1.9rem;
+    height: 1.9rem;
+    border-radius: 999px;
+    background: var(--surface-3);
+    color: var(--text-dim);
+    font-family: var(--display);
+    font-weight: 700;
+    font-size: 0.85rem;
+    flex-shrink: 0;
+}
+.schedule-pairing {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-family: var(--display);
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    font-size: 0.95rem;
+    flex: 1 1 auto;
+    min-width: 0;
+}
+.schedule-team { white-space: nowrap; }
+.schedule-vs {
+    color: var(--text-dim);
+    font-size: 0.75rem;
+    letter-spacing: 0.1em;
+}
+.schedule-row-side {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    justify-content: space-between;
+    flex-wrap: wrap;
+}
+.schedule-result {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-family: var(--mono);
+}
+.schedule-row-controls {
+    display: inline-flex;
+    gap: 0.2rem;
+    margin-left: auto;
+}
+.schedule-row-controls .icon-btn { padding: 0.3rem 0.5rem; }
+@media (max-width: 600px) {
+    .schedule-row-main { gap: 0.5rem; }
+    .schedule-pairing { font-size: 0.85rem; }
+}
 .live-timeouts {
     display: inline-flex;
     align-items: center;
@@ -1731,11 +1841,12 @@ nav.tournament-tabs {
 }
 nav.tournament-tabs button {
     flex: 1 0 auto;
-    padding: 0.55rem 0.9rem;
+    padding: 0.55rem 0.9rem 0.4rem;
     background: transparent;
     color: var(--text-dim);
     border: none;
-    border-radius: 7px;
+    border-bottom: 2px solid transparent;
+    border-radius: 0;
     font-family: var(--display);
     font-weight: 600;
     font-size: 0.78rem;
@@ -1743,15 +1854,15 @@ nav.tournament-tabs button {
     text-transform: uppercase;
     cursor: pointer;
     white-space: nowrap;
-    transition: background .15s, color .15s;
+    transition: color .15s, border-color .15s;
 }
 nav.tournament-tabs button:hover {
     color: var(--text);
-    background: rgba(255, 255, 255, 0.04);
 }
 nav.tournament-tabs button.active {
-    background: var(--accent);
-    color: var(--jersey-fg);
+    color: var(--accent);
+    border-bottom-color: var(--accent);
+    background: transparent;
 }
 .live-match-block + .live-match-block,
 .live-match-block { margin-top: 0; }
@@ -1889,6 +2000,30 @@ nav.tournament-tabs button.active {
     border-color: var(--accent);
     background: var(--surface-3);
     transform: translateY(-1px);
+}
+.kind-option.selected {
+    border-color: var(--accent);
+    background: rgba(57, 255, 20, 0.08);
+    box-shadow: 0 0 0 2px var(--accent-glow);
+}
+.kind-chooser-subheading {
+    margin: 1rem 0 0.5rem;
+    font-family: var(--display);
+    font-size: 0.85rem;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--text-dim);
+    font-weight: 700;
+}
+.kind-chooser-error {
+    color: var(--danger);
+    margin-top: 0.5rem;
+}
+.duration-field input[type="text"] {
+    width: auto;
+    flex: 1;
+    text-align: left;
+    font-family: var(--body);
 }
 .kind-option-icon {
     font-size: 1.6rem;

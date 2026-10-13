@@ -228,7 +228,7 @@ const computeTimeoutTime = (state, timeoutDurationMin, now) => {
 const TOURNAMENT_KIND_TEAMS = "teams";
 const TOURNAMENT_KIND_ROSTER = "roster";
 
-const makeTournament = (name, kind = TOURNAMENT_KIND_TEAMS, date) => ({
+const makeTournament = (name, kind = TOURNAMENT_KIND_TEAMS, date, matchDurationMin, timeoutDurationMin) => ({
     id: uid(),
     name,
     kind,
@@ -247,8 +247,8 @@ const makeTournament = (name, kind = TOURNAMENT_KIND_TEAMS, date) => ({
     activeMatches: {},
     endedAt: null,
     createdAt: new Date().toISOString(),
-    matchDurationMin: DEFAULT_MATCH_MIN,
-    timeoutDurationMin: DEFAULT_TIMEOUT_MIN,
+    matchDurationMin: Math.max(1, Number(matchDurationMin) || DEFAULT_MATCH_MIN),
+    timeoutDurationMin: Math.max(1, Number(timeoutDurationMin) || DEFAULT_TIMEOUT_MIN),
 });
 
 // Distinct colors for tournament teams, cycled by team index. Enough for
@@ -350,6 +350,17 @@ const normalizeTournament = (t) => {
         // before viewers see them. Default true so pre-existing data (and
         // teams-kind tournaments, which don't use the gate) stay visible.
         teamsFinalized: t.teamsFinalized === undefined ? true : !!t.teamsFinalized,
+        // Admin-authored ordered list of match pairings. Each: { id, teamAId,
+        // teamBId }. (`scheduledAt` from older data is dropped — times aren't
+        // part of the schedule anymore.)
+        schedule: Array.isArray(t.schedule) ? t.schedule.map(s => ({
+            id: s.id || uid(),
+            teamAId: typeof s.teamAId === "string" ? s.teamAId : null,
+            teamBId: typeof s.teamBId === "string" ? s.teamBId : null,
+        })).filter(s => s.teamAId && s.teamBId) : [],
+        // Default true so pre-existing data stays visible. Admin publishes
+        // a reshuffled schedule by setting this true.
+        scheduleFinalized: t.scheduleFinalized === undefined ? true : !!t.scheduleFinalized,
         matches: Array.isArray(t.matches) ? t.matches : [],
         activeMatches,
         endedAt: t.endedAt || null,
@@ -2922,18 +2933,51 @@ function PublicTeamsCard({ tournament }) {
     );
 }
 
-// All round-robin pairings for the tournament's teams, with the recorded
-// result shown next to each pairing (or "Pending" when it hasn't been played).
-function FixturesCard({ tournament }) {
-    const teams = tournament.teams || [];
-    const matches = tournament.matches || [];
-    if (teams.length < 2) return null;
-
-    const pairings = [];
+// Round-robin pairings for the tournament's teams, used to seed a schedule.
+const generateRoundRobin = (teams) => {
+    const out = [];
     for (let i = 0; i < teams.length; i++) {
         for (let j = i + 1; j < teams.length; j++) {
-            pairings.push({ a: teams[i], b: teams[j], aIdx: i, bIdx: j });
+            out.push({ id: uid(), teamAId: teams[i].id, teamBId: teams[j].id });
         }
+    }
+    return out;
+};
+
+// Shuffle a copy of the schedule array (Fisher-Yates), preserving items.
+const shuffleArr = (arr) => {
+    const a = [...arr];
+    for (let i = a.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [a[i], a[j]] = [a[j], a[i]];
+    }
+    return a;
+};
+
+function ScheduleCard({ tournament, patchTournament, canManage, showToast }) {
+    const teams = tournament.teams || [];
+    const matches = tournament.matches || [];
+    const schedule = tournament.schedule || [];
+    const finalized = tournament.scheduleFinalized !== false;
+
+    if (teams.length < 2) {
+        if (!canManage) return null;
+        return (
+            <div className="card">
+                <h2>Schedule</h2>
+                <div className="empty">Add at least two teams before scheduling matches.</div>
+            </div>
+        );
+    }
+
+    // Non-admin viewers see nothing until the admin publishes.
+    if (!canManage && !finalized) {
+        return (
+            <div className="card">
+                <h2>Schedule</h2>
+                <div className="empty">Admin is working on the schedule. It'll appear here once published.</div>
+            </div>
+        );
     }
 
     const pairKey = (idA, idB) => [idA, idB].sort().join("|");
@@ -2943,45 +2987,157 @@ function FixturesCard({ tournament }) {
         (byPair[k] = byPair[k] || []).push(m);
     });
 
-    const playedPairs = pairings.filter(p => (byPair[pairKey(p.a.id, p.b.id)] || []).length > 0).length;
+    const teamsById = Object.fromEntries(teams.map((t, i) => [t.id, { ...t, idx: i }]));
+    const playedCount = schedule.filter(s => (byPair[pairKey(s.teamAId, s.teamBId)] || []).length > 0).length;
+
+    const generate = () => {
+        if (!canManage) return;
+        const next = generateRoundRobin(teams);
+        patchTournament(t => ({ ...t, schedule: next, scheduleFinalized: false }));
+        showToast?.(`${next.length} match${next.length === 1 ? "" : "es"} scheduled`);
+    };
+
+    const reshuffle = () => {
+        if (!canManage) return;
+        if (schedule.length === 0) return;
+        patchTournament(t => ({
+            ...t,
+            schedule: shuffleArr(t.schedule || []),
+            scheduleFinalized: false,
+        }));
+        showToast?.("Schedule reshuffled — remember to finalize");
+    };
+
+    const clearAll = () => {
+        if (!canManage) return;
+        if (!confirm("Remove every scheduled match? Match results are kept.")) return;
+        patchTournament(t => ({ ...t, schedule: [], scheduleFinalized: true }));
+    };
+
+    const moveRow = (idx, delta) => {
+        if (!canManage) return;
+        patchTournament(t => {
+            const list = [...(t.schedule || [])];
+            const target = idx + delta;
+            if (target < 0 || target >= list.length) return t;
+            [list[idx], list[target]] = [list[target], list[idx]];
+            return { ...t, schedule: list, scheduleFinalized: false };
+        });
+    };
+
+    const removeRow = (id) => {
+        if (!canManage) return;
+        patchTournament(t => ({
+            ...t,
+            schedule: (t.schedule || []).filter(s => s.id !== id),
+            scheduleFinalized: false,
+        }));
+    };
+
+    const toggleFinalize = () => {
+        if (!canManage) return;
+        patchTournament(t => ({ ...t, scheduleFinalized: !(t.scheduleFinalized !== false) }));
+        showToast?.(finalized ? "Schedule unpublished — only you can see edits now" : "Schedule published");
+    };
 
     return (
         <div className="card">
-            <h2>Fixtures ({playedPairs}/{pairings.length})</h2>
-            <div className="fixture-list">
-                {pairings.map(({ a, b, aIdx, bIdx }) => {
-                    const played = byPair[pairKey(a.id, b.id)] || [];
-                    const colorA = teamColor(aIdx);
-                    const colorB = teamColor(bIdx);
-                    return (
-                        <div className={`fixture-row ${played.length > 0 ? "done" : "pending"}`} key={a.id + "-" + b.id}>
-                            <span className="fixture-team" style={{ color: colorA }}>{a.name}</span>
-                            <span className="fixture-vs">vs</span>
-                            <span className="fixture-team" style={{ color: colorB }}>{b.name}</span>
-                            <span className="fixture-result">
-                                {played.length === 0 ? (
-                                    <span className="fixture-pending">Pending</span>
-                                ) : (
-                                    played.map((m, i) => {
-                                        const sA = m.teamAId === a.id ? m.scoreA : m.scoreB;
-                                        const sB = m.teamAId === a.id ? m.scoreB : m.scoreA;
-                                        const aWon = sA > sB;
-                                        const bWon = sB > sA;
-                                        return (
-                                            <span key={m.id} className="fixture-score">
-                                                {i > 0 && <span className="fixture-sep">·</span>}
-                                                <span className={aWon ? "winner-side" : ""}>{sA}</span>
-                                                <span className="fixture-dash">–</span>
-                                                <span className={bWon ? "winner-side" : ""}>{sB}</span>
-                                            </span>
-                                        );
-                                    })
-                                )}
-                            </span>
-                        </div>
-                    );
-                })}
+            <div className="card-header-row">
+                <h2 style={{ margin: 0 }}>
+                    Schedule ({playedCount}/{schedule.length || 0})
+                    {canManage && !finalized && schedule.length > 0 && (
+                        <span className="draft-badge" title="Only you can see this draft until you publish">Draft</span>
+                    )}
+                </h2>
             </div>
+
+            {schedule.length === 0 ? (
+                <div className="empty">
+                    {canManage
+                        ? "No schedule yet. Generate a round-robin from the current teams, or add matches later."
+                        : "No matches scheduled yet."}
+                </div>
+            ) : (
+                <div className="schedule-list">
+                    {schedule.map((s, idx) => {
+                        const a = teamsById[s.teamAId];
+                        const b = teamsById[s.teamBId];
+                        if (!a || !b) return null;
+                        const played = byPair[pairKey(s.teamAId, s.teamBId)] || [];
+                        const colorA = teamColor(a.idx);
+                        const colorB = teamColor(b.idx);
+                        return (
+                            <div className={`schedule-row ${played.length > 0 ? "done" : "pending"}`} key={s.id}>
+                                <div className="schedule-row-main">
+                                    <span className="schedule-pos">{idx + 1}</span>
+                                    <div className="schedule-pairing">
+                                        <span className="schedule-team" style={{ color: colorA }}>{a.name}</span>
+                                        <span className="schedule-vs">vs</span>
+                                        <span className="schedule-team" style={{ color: colorB }}>{b.name}</span>
+                                    </div>
+                                </div>
+                                <div className="schedule-row-side">
+                                    <span className="schedule-result">
+                                        {played.length === 0 ? (
+                                            <span className="fixture-pending">Pending</span>
+                                        ) : (
+                                            played.map((m, i) => {
+                                                const sA = m.teamAId === a.id ? m.scoreA : m.scoreB;
+                                                const sB = m.teamAId === a.id ? m.scoreB : m.scoreA;
+                                                const aWon = sA > sB;
+                                                const bWon = sB > sA;
+                                                return (
+                                                    <span key={m.id} className="fixture-score">
+                                                        {i > 0 && <span className="fixture-sep">·</span>}
+                                                        <span className={aWon ? "winner-side" : ""}>{sA}</span>
+                                                        <span className="fixture-dash">–</span>
+                                                        <span className={bWon ? "winner-side" : ""}>{sB}</span>
+                                                    </span>
+                                                );
+                                            })
+                                        )}
+                                    </span>
+                                    {canManage && (
+                                        <div className="schedule-row-controls">
+                                            <button className="icon-btn" onClick={() => moveRow(idx, -1)} disabled={idx === 0} title="Move up">▲</button>
+                                            <button className="icon-btn" onClick={() => moveRow(idx, +1)} disabled={idx === schedule.length - 1} title="Move down">▼</button>
+                                            <button className="icon-btn" onClick={() => removeRow(s.id)} title="Remove">✕</button>
+                                        </div>
+                                    )}
+                                </div>
+                            </div>
+                        );
+                    })}
+                </div>
+            )}
+
+            {canManage && (
+                <>
+                    <div className="btn-row" style={{ marginTop: "0.75rem" }}>
+                        <button className="btn" onClick={generate}>
+                            {schedule.length > 0 ? "Regenerate round-robin" : "Generate round-robin"}
+                        </button>
+                        {schedule.length > 0 && (
+                            <button className="btn btn-secondary" onClick={reshuffle}>Reshuffle order</button>
+                        )}
+                        {schedule.length > 0 && (
+                            <button className="btn btn-secondary danger" onClick={clearAll}>Clear</button>
+                        )}
+                    </div>
+                    {schedule.length > 0 && (
+                        <div className="btn-row">
+                            {!finalized ? (
+                                <button className="btn" onClick={toggleFinalize}>Finalize schedule · Publish</button>
+                            ) : (
+                                <button className="btn btn-secondary" onClick={toggleFinalize}>Edit schedule (unpublish)</button>
+                            )}
+                        </div>
+                    )}
+                    {!finalized && schedule.length > 0 && (
+                        <p className="help-text">Only you can see this schedule. Tap <strong>Finalize schedule · Publish</strong> to make it visible to everyone.</p>
+                    )}
+                </>
+            )}
         </div>
     );
 }
@@ -3056,17 +3212,83 @@ function TournamentMatchCard({ match, teams, index, canDelete, onDelete }) {
     );
 }
 
-function KindChooserCard({ onPick, onCancel }) {
+function KindChooserCard({ onCreate, onCancel, existingNames }) {
+    const [name, setName] = useState("");
+    const [date, setDate] = useState(todayISO());
+    const [matchMin, setMatchMin] = useState(DEFAULT_MATCH_MIN);
+    const [timeoutMin, setTimeoutMin] = useState(DEFAULT_TIMEOUT_MIN);
+    const [kind, setKind] = useState(null);
+    const [error, setError] = useState("");
+
+    const trimmedName = name.trim();
+    const nameTaken = !!trimmedName && (existingNames || []).some(n => n.toLowerCase() === trimmedName.toLowerCase());
+    const canCreate = !!trimmedName && !!kind && !nameTaken;
+
+    const handleCreate = () => {
+        if (!canCreate) {
+            if (!trimmedName) setError("Please enter a tournament name.");
+            else if (!kind) setError("Pick a tournament kind.");
+            else if (nameTaken) setError("A tournament with that name already exists.");
+            return;
+        }
+        onCreate({ kind, name: trimmedName, date, matchMin, timeoutMin });
+    };
+
     return (
         <div className="card kind-chooser">
-            <h2>What kind of tournament?</h2>
-            <p className="help-text" style={{ marginTop: 0 }}>
-                Pick how teams will be formed. You can create more of either kind later.
-            </p>
+            <h2>Create a new tournament</h2>
+
+            <div className="duration-grid">
+                <label className="duration-field duration-field-wide">
+                    <span>Name</span>
+                    <input
+                        type="text"
+                        value={name}
+                        placeholder="e.g. Weekly Game"
+                        onChange={e => { setName(e.target.value); if (error) setError(""); }}
+                        onKeyDown={e => { if (e.key === "Enter") handleCreate(); }}
+                        autoFocus
+                    />
+                </label>
+                <label className="duration-field">
+                    <span>Date</span>
+                    <input
+                        type="date"
+                        value={date}
+                        onChange={e => setDate(e.target.value || todayISO())}
+                    />
+                </label>
+                <div className="duration-row-break"></div>
+                <label className="duration-field">
+                    <span>Match length</span>
+                    <input
+                        type="number" min="1" max="99"
+                        value={matchMin}
+                        onChange={e => setMatchMin(Math.max(1, Number(e.target.value) || DEFAULT_MATCH_MIN))}
+                    />
+                    <span className="duration-unit">min</span>
+                </label>
+                <label className="duration-field">
+                    <span>Timeout length</span>
+                    <input
+                        type="number" min="1" max="10"
+                        value={timeoutMin}
+                        onChange={e => setTimeoutMin(Math.max(1, Number(e.target.value) || DEFAULT_TIMEOUT_MIN))}
+                    />
+                    <span className="duration-unit">min</span>
+                </label>
+                <p className="help-text duration-help">
+                    {TIMEOUTS_PER_TEAM} timeouts per team per match. All fields lock once the tournament is created.
+                </p>
+            </div>
+
+            <h3 className="kind-chooser-subheading">Pick a kind</h3>
             <div className="kind-grid">
                 <button
-                    className="kind-option"
-                    onClick={() => onPick(TOURNAMENT_KIND_ROSTER)}
+                    type="button"
+                    className={`kind-option ${kind === TOURNAMENT_KIND_ROSTER ? "selected" : ""}`}
+                    onClick={() => { setKind(TOURNAMENT_KIND_ROSTER); if (error) setError(""); }}
+                    aria-pressed={kind === TOURNAMENT_KIND_ROSTER}
                 >
                     <span className="kind-option-icon" aria-hidden="true">🎲</span>
                     <span className="kind-option-title">Roster · AI teams</span>
@@ -3076,8 +3298,10 @@ function KindChooserCard({ onPick, onCancel }) {
                     </span>
                 </button>
                 <button
-                    className="kind-option"
-                    onClick={() => onPick(TOURNAMENT_KIND_TEAMS)}
+                    type="button"
+                    className={`kind-option ${kind === TOURNAMENT_KIND_TEAMS ? "selected" : ""}`}
+                    onClick={() => { setKind(TOURNAMENT_KIND_TEAMS); if (error) setError(""); }}
+                    aria-pressed={kind === TOURNAMENT_KIND_TEAMS}
                 >
                     <span className="kind-option-icon" aria-hidden="true">🏆</span>
                     <span className="kind-option-title">Preset teams</span>
@@ -3087,8 +3311,12 @@ function KindChooserCard({ onPick, onCancel }) {
                     </span>
                 </button>
             </div>
+
+            {error && <p className="help-text kind-chooser-error">{error}</p>}
+
             <div className="btn-row">
                 <button className="btn btn-secondary" onClick={onCancel}>Cancel</button>
+                <button className="btn" onClick={handleCreate} disabled={!canCreate}>Create tournament</button>
             </div>
         </div>
     );
@@ -3111,15 +3339,9 @@ function TournamentView({ tournaments, setTournaments, rosterTemplates, setRoste
 
     const [picking, setPicking] = useState(false);
 
-    const createTournament = (kind) => {
+    const createTournament = ({ kind, name, date, matchMin, timeoutMin }) => {
         const label = kind === TOURNAMENT_KIND_ROSTER ? "Roster tournament" : "Team tournament";
-        const name = (prompt(`${label} name:`) || "").trim();
-        if (!name) return;
-        if (tournaments.some(t => t.name.toLowerCase() === name.toLowerCase())) {
-            alert("A tournament with that name already exists.");
-            return;
-        }
-        const t = makeTournament(name, kind);
+        const t = makeTournament(name, kind, date, matchMin, timeoutMin);
         setTournaments(prev => [...prev, t]);
         setSelectedId(t.id);
         setTournamentTab(kind === TOURNAMENT_KIND_ROSTER ? "roster" : "teams");
@@ -3147,15 +3369,10 @@ function TournamentView({ tournaments, setTournaments, rosterTemplates, setRoste
         showToast?.("Tournament deleted");
     };
 
-    const setDate = (newDate) => patchTournament(t => ({ ...t, date: newDate }));
-    const setMatchMin = (val) => patchTournament(t => ({
-        ...t,
-        matchDurationMin: Math.max(1, Number(val) || DEFAULT_MATCH_MIN),
-    }));
-    const setTimeoutMin = (val) => patchTournament(t => ({
-        ...t,
-        timeoutDurationMin: Math.max(1, Number(val) || DEFAULT_TIMEOUT_MIN),
-    }));
+    const setDate = (newDate) => {
+        if (!newDate) return;
+        patchTournament(t => ({ ...t, date: newDate }));
+    };
 
     const endTournament = () => {
         if (!activeTournament) return;
@@ -3190,8 +3407,9 @@ function TournamentView({ tournaments, setTournaments, rosterTemplates, setRoste
                 </div>
                 {canManage && picking && (
                     <KindChooserCard
-                        onPick={createTournament}
+                        onCreate={createTournament}
                         onCancel={() => setPicking(false)}
+                        existingNames={tournaments.map(t => t.name)}
                     />
                 )}
             </>
@@ -3218,7 +3436,7 @@ function TournamentView({ tournaments, setTournaments, rosterTemplates, setRoste
         ...(isRoster
             ? [{ key: "roster", label: "Roster" }, { key: "teams", label: "Teams" }]
             : [{ key: "teams", label: "Teams" }]),
-        { key: "fixtures", label: "Fixtures" },
+        { key: "schedule", label: "Schedule" },
         ...(canRecord ? [{ key: "score", label: "Score" }] : []),
         { key: "matches", label: `Matches (${played})` },
         ...(otherTournaments.length > 0 ? [{ key: "past", label: "Past" }] : []),
@@ -3230,8 +3448,9 @@ function TournamentView({ tournaments, setTournaments, rosterTemplates, setRoste
         <div>
             {canManage && picking && (
                 <KindChooserCard
-                    onPick={createTournament}
+                    onCreate={createTournament}
                     onCancel={() => setPicking(false)}
+                    existingNames={tournaments.map(t => t.name)}
                 />
             )}
             {canManage && (
@@ -3282,6 +3501,7 @@ function TournamentView({ tournaments, setTournaments, rosterTemplates, setRoste
                                 type="date"
                                 value={activeTournament.date || todayISO()}
                                 onChange={e => setDate(e.target.value)}
+                                title="Change tournament date"
                             />
                         ) : (
                             <span className="tournament-date">{formatDate(activeTournament.date)}</span>
@@ -3308,37 +3528,9 @@ function TournamentView({ tournaments, setTournaments, rosterTemplates, setRoste
                     <div className="stat"><div className="num">{played}</div><div className="label">Played</div></div>
                     <div className="stat"><div className="num">{remainingMatches}</div><div className="label">Remaining</div></div>
                 </div>
-                {canManage && (
-                    <div className="duration-grid pre-match-settings">
-                        <label className="duration-field">
-                            <span>Match length</span>
-                            <input type="number" min="1" max="99"
-                                value={activeTournament.matchDurationMin || DEFAULT_MATCH_MIN}
-                                onChange={e => setMatchMin(e.target.value)}
-                                disabled={played > 0}
-                            />
-                            <span className="duration-unit">min</span>
-                        </label>
-                        <label className="duration-field">
-                            <span>Timeout length</span>
-                            <input type="number" min="1" max="10"
-                                value={activeTournament.timeoutDurationMin || DEFAULT_TIMEOUT_MIN}
-                                onChange={e => setTimeoutMin(e.target.value)}
-                                disabled={played > 0}
-                            />
-                            <span className="duration-unit">min</span>
-                        </label>
-                        <p className="help-text duration-help">
-                            {TIMEOUTS_PER_TEAM} timeouts per team per match.
-                            {played > 0 ? " Locked once the first match is recorded." : " Lock in before the first match."}
-                        </p>
-                    </div>
-                )}
-                {!canManage && (
-                    <p className="help-text" style={{ textAlign: "center" }}>
-                        {activeTournament.matchDurationMin || DEFAULT_MATCH_MIN} min matches · {activeTournament.timeoutDurationMin || DEFAULT_TIMEOUT_MIN} min timeouts · {TIMEOUTS_PER_TEAM} per team
-                    </p>
-                )}
+                <p className="help-text" style={{ textAlign: "center" }}>
+                    {activeTournament.matchDurationMin || DEFAULT_MATCH_MIN} min matches · {activeTournament.timeoutDurationMin || DEFAULT_TIMEOUT_MIN} min timeouts · {TIMEOUTS_PER_TEAM} per team
+                </p>
             </div>
 
             <nav className="tournament-tabs">
@@ -3390,8 +3582,13 @@ function TournamentView({ tournaments, setTournaments, rosterTemplates, setRoste
                 />
             )}
 
-            {currentTab === "fixtures" && (
-                <FixturesCard tournament={activeTournament} />
+            {currentTab === "schedule" && (
+                <ScheduleCard
+                    tournament={activeTournament}
+                    patchTournament={patchTournament}
+                    canManage={canManage}
+                    showToast={showToast}
+                />
             )}
 
             {currentTab === "score" && canRecord && (
@@ -4088,6 +4285,7 @@ function App() {
 
     return (
         <div className="app">
+            <div className="sticky-top">
             <header>
                 <div className="logo">
                     <div className="logo-mark">
@@ -4099,8 +4297,7 @@ function App() {
                         </svg>
                     </div>
                     <div className="logo-text">
-                        <span className="logo-title">Sport Club</span>
-                        <span className="logo-sub">Team Manager</span>
+                        <span className="logo-title">Volleyball Club</span>
                     </div>
                 </div>
                 {authReady && (
@@ -4133,6 +4330,7 @@ function App() {
                     onClick={() => setSection("tournament")}
                 >Tournament</button>
             </nav>
+            </div>
 
             {section === "live" ? (
                 <LiveView
