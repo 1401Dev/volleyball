@@ -3439,6 +3439,7 @@ function TournamentView({ tournaments, setTournaments, rosterTemplates, setRoste
         { key: "schedule", label: "Schedule" },
         ...(canRecord ? [{ key: "score", label: "Score" }] : []),
         { key: "matches", label: `Matches (${played})` },
+        { key: "rules", label: "Rules" },
         ...(otherTournaments.length > 0 ? [{ key: "past", label: "Past" }] : []),
     ];
     const validKeys = tabs.map(t => t.key);
@@ -3523,14 +3524,6 @@ function TournamentView({ tournaments, setTournaments, rosterTemplates, setRoste
                         🏆 Winner: <strong style={{ color: championColor }}>{champion.name}</strong>
                     </div>
                 )}
-                <div className="tournament-stats">
-                    <div className="stat"><div className="num">{teams.length}</div><div className="label">Teams</div></div>
-                    <div className="stat"><div className="num">{played}</div><div className="label">Played</div></div>
-                    <div className="stat"><div className="num">{remainingMatches}</div><div className="label">Remaining</div></div>
-                </div>
-                <p className="help-text" style={{ textAlign: "center" }}>
-                    {activeTournament.matchDurationMin || DEFAULT_MATCH_MIN} min matches · {activeTournament.timeoutDurationMin || DEFAULT_TIMEOUT_MIN} min timeouts · {TIMEOUTS_PER_TEAM} per team
-                </p>
             </div>
 
             <nav className="tournament-tabs">
@@ -3619,6 +3612,22 @@ function TournamentView({ tournaments, setTournaments, rosterTemplates, setRoste
                             ))}
                         </div>
                     )}
+                </div>
+            )}
+
+            {currentTab === "rules" && (
+                <div className="card">
+                    <h2>Rules</h2>
+                    <div className="tournament-stats">
+                        <div className="stat"><div className="num">{teams.length}</div><div className="label">Teams</div></div>
+                        <div className="stat"><div className="num">{played}</div><div className="label">Played</div></div>
+                        <div className="stat"><div className="num">{remainingMatches}</div><div className="label">Remaining</div></div>
+                    </div>
+                    <ul className="rules-list">
+                        <li><span>Match length</span><strong>{activeTournament.matchDurationMin || DEFAULT_MATCH_MIN} min</strong></li>
+                        <li><span>Timeout length</span><strong>{activeTournament.timeoutDurationMin || DEFAULT_TIMEOUT_MIN} min</strong></li>
+                        <li><span>Timeouts per team per match</span><strong>{TIMEOUTS_PER_TEAM}</strong></li>
+                    </ul>
                 </div>
             )}
 

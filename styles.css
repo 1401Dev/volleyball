@@ -1060,6 +1060,26 @@ nav.section-nav button.active::after { display: none; }
     letter-spacing: 0.08em;
 }
 
+.rules-list {
+    list-style: none;
+    padding: 0;
+    margin: 1rem 0 0;
+    display: grid;
+    gap: 0.5rem;
+}
+.rules-list li {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 1rem;
+    padding: 0.65rem 0.85rem;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+}
+.rules-list li span { color: var(--text-dim); }
+.rules-list li strong { color: var(--text); font-family: var(--display); }
+
 /* Standings table */
 .standings-wrap { overflow-x: auto; }
 .standings {
