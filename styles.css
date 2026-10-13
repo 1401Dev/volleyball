@@ -1537,42 +1537,93 @@ nav.section-nav button.active::after { display: none; }
 }
 .live-timer-row {
     display: flex;
+    align-items: center;
     justify-content: center;
-    margin-bottom: 1rem;
+    gap: 0.75rem;
+    margin: 0.25rem 0 0.75rem;
+    flex-wrap: wrap;
 }
 .live-timer {
     display: inline-flex;
-    flex-direction: column;
     align-items: center;
-    padding: 0.5rem 1.2rem;
+    gap: 0.75rem;
+    padding: 0.55rem 1.1rem;
     background: var(--surface-2);
     border: 1px solid var(--border);
     border-radius: 10px;
-    gap: 0.2rem;
-    min-width: 120px;
 }
-.live-timer-row.expired .live-timer {
+.live-timer-main.running {
+    border-color: var(--accent);
+    background: rgba(57, 255, 20, 0.08);
+}
+.live-timer-main.paused {
+    border-color: var(--cat-2);
+    background: rgba(255, 193, 7, 0.08);
+}
+.live-timer-main.running .live-timer-label { color: var(--accent); }
+.live-timer-main.paused .live-timer-label { color: var(--cat-2); }
+.live-timer-row.expired .live-timer-main {
     border-color: var(--danger);
     background: rgba(239, 68, 68, 0.08);
 }
 .live-timer-label {
     font-family: var(--display);
     font-weight: 700;
-    font-size: 0.65rem;
+    font-size: 0.7rem;
     letter-spacing: 0.14em;
     text-transform: uppercase;
     color: var(--text-dim);
 }
-.live-timer-row.expired .live-timer-label { color: var(--danger); }
+.live-timer-row.expired .live-timer-main .live-timer-label { color: var(--danger); }
 .live-timer-value {
     font-family: var(--mono);
-    font-size: 1.8rem;
+    font-size: 2.4rem;
     font-weight: 700;
     letter-spacing: 0.05em;
     line-height: 1;
     color: var(--text);
 }
-.live-timer-row.expired .live-timer-value { color: var(--danger); }
+.live-timer-row.expired .live-timer-main .live-timer-value { color: var(--danger); }
+/* When a timeout is active, de-emphasise the paused match timer so the
+   timeout count takes the eye. */
+.live-timer-row.with-timeout .live-timer-main {
+    opacity: 0.75;
+}
+.live-timer-timeout {
+    animation: live-timeout-pulse 1.4s ease-in-out infinite;
+}
+@keyframes live-timeout-pulse {
+    0%, 100% { transform: scale(1); }
+    50% { transform: scale(1.04); }
+}
+@media (max-width: 480px) {
+    .live-timer-value { font-size: 2rem; }
+    .live-timer { padding: 0.6rem 1rem; }
+}
+/* Emergency variant used for "end timeout without resuming" — rare, so it
+   reads as a warning instead of a normal secondary button. */
+.btn.emergency-btn {
+    border-color: var(--danger);
+    color: var(--danger);
+    font-size: 0.8rem;
+}
+.btn.emergency-btn:hover {
+    background: rgba(239, 68, 68, 0.1);
+}
+.draft-badge {
+    display: inline-block;
+    margin-left: 0.6rem;
+    padding: 0.15rem 0.5rem;
+    font-size: 0.65rem;
+    font-weight: 700;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--cat-2);
+    border: 1px solid var(--cat-2);
+    background: rgba(255, 193, 7, 0.1);
+    border-radius: 999px;
+    vertical-align: middle;
+}
 .live-timeouts {
     display: inline-flex;
     align-items: center;
@@ -1720,7 +1771,16 @@ nav.tournament-tabs button.active {
     font-weight: 700;
 }
 @media (max-width: 600px) {
-    .tournament-title-big { font-size: 1.6rem; }
+    .tournament-title-big { font-size: 1.6rem; word-break: normal; overflow-wrap: anywhere; }
+    .tournament-hero {
+        flex-direction: column;
+        align-items: stretch;
+        gap: 0.6rem;
+    }
+    .tournament-hero-date {
+        margin-left: 0;
+        justify-content: flex-start;
+    }
 }
 .live-head {
     display: flex;
@@ -1796,4 +1856,203 @@ nav.tournament-tabs button.active {
     .standings tbody td { padding: 0.45rem 0.25rem; }
     .standings td.pts-col { font-size: 0.95rem; }
     .tournament-stats .num { font-size: 1.2rem; }
+}
+
+/* ------------------------------------------------------------------ */
+/* Tournament kind: chooser + badge                                   */
+/* ------------------------------------------------------------------ */
+.kind-chooser h2 {
+    margin-top: 0;
+}
+.kind-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0.75rem;
+    margin: 0.75rem 0 1rem;
+}
+.kind-option {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0.4rem;
+    padding: 1rem;
+    background: var(--surface-2);
+    border: 1px solid var(--border-strong);
+    border-radius: 10px;
+    color: var(--text);
+    cursor: pointer;
+    text-align: left;
+    transition: border-color 0.15s, background 0.15s, transform 0.1s;
+    font-family: inherit;
+}
+.kind-option:hover {
+    border-color: var(--accent);
+    background: var(--surface-3);
+    transform: translateY(-1px);
+}
+.kind-option-icon {
+    font-size: 1.6rem;
+    line-height: 1;
+}
+.kind-option-title {
+    font-family: var(--display);
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    font-size: 0.95rem;
+    color: var(--accent);
+}
+.kind-option-desc {
+    font-size: 0.85rem;
+    color: var(--text-dim);
+    line-height: 1.4;
+}
+.kind-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    padding: 0.2rem 0.55rem;
+    border-radius: 999px;
+    font-size: 0.72rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    border: 1px solid var(--border-strong);
+    background: var(--surface-2);
+    color: var(--text-dim);
+}
+.kind-badge.kind-roster {
+    color: var(--accent-2);
+    border-color: var(--accent-2);
+    background: rgba(0, 240, 255, 0.08);
+}
+.kind-badge.kind-teams {
+    color: var(--cat-2);
+    border-color: var(--cat-2);
+    background: rgba(255, 193, 7, 0.08);
+}
+
+@media (max-width: 600px) {
+    .kind-grid { grid-template-columns: 1fr; }
+}
+
+/* ------------------------------------------------------------------ */
+/* Roster templates: seed chooser + save/replace toolbar              */
+/* ------------------------------------------------------------------ */
+.roster-seed {
+    margin-top: 0.75rem;
+    padding-top: 0.75rem;
+    border-top: 1px dashed var(--border-strong);
+}
+.roster-seed-label {
+    display: block;
+    font-size: 0.8rem;
+    color: var(--text-dim);
+    margin-bottom: 0.4rem;
+    letter-spacing: 0.04em;
+}
+.roster-tool-row {
+    display: flex;
+    gap: 0.4rem;
+    align-items: center;
+    flex-wrap: wrap;
+}
+.roster-tool-row select {
+    min-width: 160px;
+}
+
+/* ------------------------------------------------------------------ */
+/* Live view: compact-by-default card + per-match brief row           */
+/* ------------------------------------------------------------------ */
+.live-card .live-head-clickable {
+    cursor: pointer;
+    user-select: none;
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 0.4rem 0.5rem;
+    margin: -0.4rem -0.5rem 0.9rem;
+    border-radius: 8px;
+    transition: background 0.15s;
+    border-bottom: 1px solid var(--border);
+    border-bottom-left-radius: 0;
+    border-bottom-right-radius: 0;
+    padding-bottom: 0.8rem;
+}
+.live-card.collapsed .live-head-clickable {
+    border-bottom: none;
+    padding-bottom: 0.4rem;
+    margin-bottom: 0.6rem;
+}
+.live-head-clickable:hover {
+    background: rgba(255,255,255,0.03);
+}
+.live-head-clickable:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+}
+.live-chevron {
+    margin-left: auto;
+    color: var(--text-dim);
+    font-size: 1rem;
+    flex-shrink: 0;
+}
+.live-brief-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+}
+.live-brief {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+    padding: 0.6rem 0.75rem;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    flex-wrap: wrap;
+}
+.live-brief-score {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-family: var(--display);
+    font-weight: 700;
+    font-size: 1rem;
+    letter-spacing: 0.03em;
+}
+.live-brief-team {
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    font-size: 0.85rem;
+}
+.live-brief-num {
+    font-size: 1.4rem;
+    color: var(--text);
+    min-width: 1.4rem;
+    text-align: center;
+}
+.live-brief-dash {
+    color: var(--text-dim);
+}
+.live-brief-time {
+    display: flex;
+    align-items: baseline;
+    gap: 0.5rem;
+    color: var(--text-dim);
+}
+.live-brief-status {
+    font-size: 0.75rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+}
+.live-brief-clock {
+    font-family: var(--mono);
+    font-size: 1rem;
+    color: var(--text);
+}
+.live-controls {
+    margin-top: 0.5rem;
+    flex-wrap: wrap;
 }

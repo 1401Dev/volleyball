@@ -29,40 +29,7 @@ const isScorerUid = (uid) => !!uid && SCORER_UIDS.has(uid);
 const STORAGE_KEY = "volleyball-organizer-v3";
 const LEGACY_KEY_V2 = "volleyball-organizer-v2";
 
-const PRESET_ROSTER = [
-    // Category 1
-    { name: "Dharmeshbhai", category: 1, rank: 1 },
-    { name: "Jaybhai",      category: 1, rank: 2 },
-    { name: "Onibhai",      category: 1, rank: 3 },
-    { name: "Rushik",       category: 1, rank: 4 },
-    { name: "Shiv",         category: 1, rank: 5 },
-    { name: "Dev",          category: 1, rank: 6 },
-    { name: "Shivang",    category: 1, rank: 7 },
-    { name: "Anvinbhai",      category: 1, rank: 8 },
-    // Category 2
-    { name: "Mihirbhai",    category: 2, rank: 1 },
-    { name: "Ashishbhai",   category: 2, rank: 2 },
-    { name: "Darshan",      category: 2, rank: 3 },
-    { name: "Jimmybhai",    category: 2, rank: 4 },
-    { name: "Rupeshbhai",   category: 2, rank: 5 },
-    { name: "Primalbhai",   category: 2, rank: 6 },
-    { name: "Harshalbhai",  category: 2, rank: 7 },
-    { name: "Hirenbhai",    category: 2, rank: 8 },
-    // Category 3
-    { name: "Nayanbhai",    category: 3, rank: 1 },
-    { name: "Sameerbhai",   category: 3, rank: 2 },
-    { name: "Samirbhai",    category: 3, rank: 3 },
-    { name: "Atulbhai",     category: 3, rank: 4 },
-    { name: "Vijaybhai",    category: 3, rank: 5 },
-    { name: "Pranaybhai",   category: 3, rank: 6 },
-    { name: "Vipulbhai",    category: 3, rank: 7 },
-    { name: "Pareshbhai",   category: 3, rank: 8 },
-    { name: "Arpanbhai",    category: 3, rank: 9 },
-    { name: "Anilbhai",     category: 3, rank: 10 },
-];
-
 const uid = () => Math.random().toString(36).slice(2, 10);
-const seedRoster = () => PRESET_ROSTER.map(p => ({ id: uid(), ...p }));
 
 const makeRoster = (name, members = []) => ({
     id: uid(),
@@ -133,7 +100,19 @@ const normalizeState = (parsed) => {
         const activeRosterId = rosters.some(r => r.id === parsed.activeRosterId)
             ? parsed.activeRosterId
             : rosters[0].id;
-        return { rosters, activeRosterId, tournaments };
+        const rosterTemplates = Array.isArray(parsed.rosterTemplates)
+            ? parsed.rosterTemplates.map(tpl => ({
+                id: tpl.id || uid(),
+                name: tpl.name || "Untitled roster",
+                members: Array.isArray(tpl.members) ? tpl.members.map(m => ({
+                    id: m.id || uid(),
+                    name: typeof m.name === "string" ? m.name : "",
+                    category: [1, 2, 3].includes(Number(m.category)) ? Number(m.category) : 3,
+                    rank: Number.isFinite(Number(m.rank)) ? Number(m.rank) : 0,
+                })).filter(m => m.name) : [],
+            })).filter(tpl => tpl.name)
+            : [];
+        return { rosters, activeRosterId, tournaments, rosterTemplates };
     }
     return null;
 };
@@ -151,7 +130,7 @@ const loadState = () => {
             const roster = {
                 id: uid(),
                 name: "MOCA Volleyball Group",
-                members: Array.isArray(old.members) && old.members.length ? old.members : seedRoster(),
+                members: Array.isArray(old.members) ? old.members : [],
                 sessions: Array.isArray(old.sessions) ? old.sessions : [],
                 currentSession: old.currentSession || null,
             };
@@ -244,10 +223,22 @@ const computeTimeoutTime = (state, timeoutDurationMin, now) => {
     return { active: state.timeoutTeam, elapsedSec, remainingSec: sec - elapsedSec, expired: elapsedSec >= sec };
 };
 
-const makeTournament = (name, date) => ({
+// kind: 'teams' = teams added manually (big tournament, every state has a team).
+// kind: 'roster' = roster of players; AI generates balanced teams (weekly games).
+const TOURNAMENT_KIND_TEAMS = "teams";
+const TOURNAMENT_KIND_ROSTER = "roster";
+
+const makeTournament = (name, kind = TOURNAMENT_KIND_TEAMS, date) => ({
     id: uid(),
     name,
+    kind,
     date: date || todayISO(),
+    // Roster-kind only: pool of players with categories/ranks + availability.
+    rosterMembers: [],
+    availableIds: [],
+    // Archived past rounds (roster-kind): each is a snapshot of a completed
+    // week's teams + matches. Lets the user reshuffle without losing history.
+    rounds: [],
     teams: [],
     matches: [],
     // One active-match slot per scorer (keyed by their uid). Lets multiple
@@ -320,16 +311,45 @@ const normalizeTournament = (t) => {
     // Older data had a single tournament.activeMatch. It's intentionally
     // dropped here: that one slot never belonged to any specific scorer, and
     // keeping it around would show as an un-ownable ghost on the Live tab.
+    const kind = t.kind === TOURNAMENT_KIND_ROSTER ? TOURNAMENT_KIND_ROSTER : TOURNAMENT_KIND_TEAMS;
+    const rosterMembers = Array.isArray(t.rosterMembers) ? t.rosterMembers.map(m => ({
+        id: m.id || uid(),
+        name: typeof m.name === "string" ? m.name : "",
+        category: [1, 2, 3].includes(Number(m.category)) ? Number(m.category) : 3,
+        rank: Number.isFinite(Number(m.rank)) ? Number(m.rank) : 0,
+    })).filter(m => m.name) : [];
+    const memberIdSet = new Set(rosterMembers.map(m => m.id));
+    const availableIds = Array.isArray(t.availableIds)
+        ? t.availableIds.filter(id => memberIdSet.has(id))
+        : rosterMembers.map(m => m.id);
+    const rounds = Array.isArray(t.rounds) ? t.rounds.map(r => ({
+        id: r.id || uid(),
+        date: r.date || todayISO(),
+        teams: Array.isArray(r.teams) ? r.teams.map(team => ({
+            id: team.id || uid(),
+            name: team.name || "Team",
+            players: Array.isArray(team.players) ? team.players.filter(p => typeof p === "string") : [],
+        })) : [],
+        matches: Array.isArray(r.matches) ? r.matches : [],
+    })) : [];
     return {
         id: t.id || uid(),
         name: t.name || "Tournament",
+        kind,
         date: t.date || todayISO(),
+        rosterMembers,
+        availableIds,
+        rounds,
         teams: Array.isArray(t.teams) ? t.teams.map(team => ({
             id: team.id || uid(),
             name: team.name || "Team",
             // v1 used playerIds (roster refs); v2+ uses free-text players.
             players: Array.isArray(team.players) ? team.players.filter(p => typeof p === "string") : [],
         })) : [],
+        // Roster-kind only: after admin generates teams, must click Finalize
+        // before viewers see them. Default true so pre-existing data (and
+        // teams-kind tournaments, which don't use the gate) stay visible.
+        teamsFinalized: t.teamsFinalized === undefined ? true : !!t.teamsFinalized,
         matches: Array.isArray(t.matches) ? t.matches : [],
         activeMatches,
         endedAt: t.endedAt || null,
@@ -803,8 +823,12 @@ function Scoreboard({ session, teams, onUpdate, onEndMatch, onSaveSession, showT
                         </span>
                     </div>
                     <div className="timeout-banner-actions">
-                        <button className="btn btn-secondary" onClick={stopTimeout} title="End timeout without restarting the match timer">Stop</button>
-                        <button className="btn" onClick={endTimeout}>End timeout &amp; resume</button>
+                        <button className="btn" onClick={endTimeout}>End timeout</button>
+                        <button
+                            className="btn btn-secondary emergency-btn"
+                            onClick={stopTimeout}
+                            title="Emergency: end timeout WITHOUT restarting the match timer (use only if the match can't resume — injury, equipment issue, etc.)"
+                        >⚠ Emergency: end without resuming</button>
                     </div>
                 </div>
             )}
@@ -1842,6 +1866,685 @@ function TeamsManagerCard({ tournament, patchTournament, disabled, showToast }) 
     );
 }
 
+// Roster-kind tournament setup: pool of players with categories + ranks,
+// availability toggles, and an AI "Generate Teams" step that creates
+// tournament.teams out of the available players.
+// Teams tab for a roster-kind tournament. Shows the generated teams (same for
+// admin and non-admin), plus the past-rounds history. For admins without
+// recorded matches yet, player drag/tap-to-move is enabled.
+function RosterTeamsCard({ tournament, patchTournament, disabled }) {
+    const teams = tournament.teams || [];
+    const matches = tournament.matches || [];
+    const rounds = tournament.rounds || [];
+    const hasMatches = matches.length > 0;
+    const canEdit = !disabled;
+    const canMovePlayers = canEdit && !hasMatches;
+    const finalized = tournament.teamsFinalized !== false;
+    const toggleFinalize = () => {
+        if (!canEdit) return;
+        if (finalized) {
+            if (!confirm("Edit teams again? They'll be hidden from viewers until you re-publish.")) return;
+            patchTournament(t => ({ ...t, teamsFinalized: false }));
+        } else {
+            patchTournament(t => ({ ...t, teamsFinalized: true }));
+        }
+    };
+
+    const [selectedPlayer, setSelectedPlayer] = useState(null);
+    const [dragOverTeam, setDragOverTeam] = useState(null);
+    const [expandedRoundId, setExpandedRoundId] = useState(null);
+
+    const movePlayerTo = (playerName, fromTeamIdx, toTeamIdx, toIdx) => {
+        if (!canMovePlayers) return;
+        patchTournament(t => {
+            const list = t.teams || [];
+            const next = list.map(team => ({ ...team, players: [...team.players] }));
+            if (!next[fromTeamIdx] || !next[toTeamIdx]) return t;
+            const srcIdx = next[fromTeamIdx].players.indexOf(playerName);
+            if (srcIdx === -1) return t;
+            next[fromTeamIdx].players.splice(srcIdx, 1);
+            let insertAt = toIdx == null ? next[toTeamIdx].players.length : toIdx;
+            if (fromTeamIdx === toTeamIdx && srcIdx < insertAt) insertAt -= 1;
+            next[toTeamIdx].players.splice(insertAt, 0, playerName);
+            return { ...t, teams: next };
+        });
+        setSelectedPlayer(null);
+    };
+
+    const swapPlayers = (p1, t1, p2, t2) => {
+        if (!canMovePlayers) return;
+        if (p1 === p2 && t1 === t2) { setSelectedPlayer(null); return; }
+        patchTournament(t => {
+            const list = t.teams || [];
+            const next = list.map(team => ({ ...team, players: [...team.players] }));
+            if (!next[t1] || !next[t2]) return t;
+            const i1 = next[t1].players.indexOf(p1);
+            const i2 = next[t2].players.indexOf(p2);
+            if (i1 === -1 || i2 === -1) return t;
+            next[t1].players[i1] = p2;
+            next[t2].players[i2] = p1;
+            return { ...t, teams: next };
+        });
+        setSelectedPlayer(null);
+    };
+
+    const handlePlayerTap = (playerName, teamIdx) => {
+        if (!canMovePlayers) return;
+        if (selectedPlayer?.playerName === playerName && selectedPlayer?.fromTeamIdx === teamIdx) {
+            setSelectedPlayer(null);
+        } else if (selectedPlayer) {
+            swapPlayers(selectedPlayer.playerName, selectedPlayer.fromTeamIdx, playerName, teamIdx);
+        } else {
+            setSelectedPlayer({ playerName, fromTeamIdx: teamIdx });
+        }
+    };
+
+    const handleTeamTap = (teamIdx) => {
+        if (!canMovePlayers) return;
+        if (selectedPlayer) movePlayerTo(selectedPlayer.playerName, selectedPlayer.fromTeamIdx, teamIdx, null);
+    };
+
+    // Non-admin viewer with teams that haven't been published yet: show a
+    // waiting placeholder instead of the draft teams.
+    if (!canEdit && teams.length > 0 && !finalized) {
+        return (
+            <div className="card">
+                <h2>Teams</h2>
+                <div className="empty">
+                    Admin is finalizing the teams. They'll appear here once published.
+                </div>
+            </div>
+        );
+    }
+
+    return (
+        <>
+            <div className="card">
+                <h2>Teams{canEdit && teams.length > 0 && !finalized && <span className="draft-badge" title="Only you can see these teams until you publish">Draft</span>}</h2>
+                {teams.length === 0 ? (
+                    <div className="empty">
+                        {canEdit
+                            ? "No teams yet. Mark players available in the Roster tab and tap Generate Teams."
+                            : "No teams yet. Teams will appear here once the admin generates them."}
+                    </div>
+                ) : (
+                    <>
+                        {canMovePlayers && selectedPlayer && (
+                            <div className="move-hint">
+                                <strong>{selectedPlayer.playerName}</strong> picked up — tap another player to swap, tap another team card to move to its end, or tap <strong>{selectedPlayer.playerName}</strong> again to cancel.
+                            </div>
+                        )}
+                        <div className="teams-grid">
+                            {teams.map((team, i) => {
+                                const droppable = canMovePlayers && selectedPlayer != null && selectedPlayer.fromTeamIdx !== i;
+                                const dragOver = canMovePlayers && dragOverTeam === i;
+                                const teamHandlers = canMovePlayers ? {
+                                    onClick: () => handleTeamTap(i),
+                                    onDragOver: e => { e.preventDefault(); e.dataTransfer.dropEffect = "move"; if (dragOverTeam !== i) setDragOverTeam(i); },
+                                    onDragLeave: e => {
+                                        if (!e.currentTarget.contains(e.relatedTarget)) setDragOverTeam(null);
+                                    },
+                                    onDrop: e => {
+                                        e.preventDefault();
+                                        setDragOverTeam(null);
+                                        try {
+                                            const data = JSON.parse(e.dataTransfer.getData("application/json"));
+                                            movePlayerTo(data.playerName, data.fromTeamIdx, i, null);
+                                        } catch {}
+                                    },
+                                } : {};
+                                return (
+                                    <div
+                                        key={team.id}
+                                        className={`team team-${i + 1} ${droppable ? "droppable" : ""} ${dragOver ? "drag-over" : ""} ${canMovePlayers ? "" : "locked"}`}
+                                        {...teamHandlers}
+                                    >
+                                        <div className="team-header">
+                                            <div className="jersey">{String.fromCharCode(65 + i)}</div>
+                                            <div className="team-title">
+                                                <span className="name">{team.name}</span>
+                                                <span className="meta">{team.players.length} Players</span>
+                                            </div>
+                                        </div>
+                                        <div className="team-players">
+                                            {team.players.map((p, playerIdx) => {
+                                                const isSelected = selectedPlayer?.playerName === p && selectedPlayer?.fromTeamIdx === i;
+                                                const playerHandlers = canMovePlayers ? {
+                                                    draggable: true,
+                                                    onDragStart: e => {
+                                                        e.dataTransfer.setData("application/json", JSON.stringify({ playerName: p, fromTeamIdx: i }));
+                                                        e.dataTransfer.effectAllowed = "move";
+                                                        e.currentTarget.classList.add("dragging");
+                                                    },
+                                                    onDragEnd: e => {
+                                                        e.currentTarget.classList.remove("dragging");
+                                                        e.currentTarget.classList.remove("drop-before", "drop-after");
+                                                        setDragOverTeam(null);
+                                                    },
+                                                    onDragOver: e => {
+                                                        e.preventDefault();
+                                                        e.stopPropagation();
+                                                        e.dataTransfer.dropEffect = "move";
+                                                        const rect = e.currentTarget.getBoundingClientRect();
+                                                        const after = (e.clientY - rect.top) > rect.height / 2;
+                                                        e.currentTarget.classList.toggle("drop-before", !after);
+                                                        e.currentTarget.classList.toggle("drop-after", after);
+                                                        if (dragOverTeam !== i) setDragOverTeam(i);
+                                                    },
+                                                    onDragLeave: e => {
+                                                        e.currentTarget.classList.remove("drop-before", "drop-after");
+                                                    },
+                                                    onDrop: e => {
+                                                        e.preventDefault();
+                                                        e.stopPropagation();
+                                                        const rect = e.currentTarget.getBoundingClientRect();
+                                                        const after = (e.clientY - rect.top) > rect.height / 2;
+                                                        e.currentTarget.classList.remove("drop-before", "drop-after");
+                                                        setDragOverTeam(null);
+                                                        try {
+                                                            const data = JSON.parse(e.dataTransfer.getData("application/json"));
+                                                            movePlayerTo(data.playerName, data.fromTeamIdx, i, playerIdx + (after ? 1 : 0));
+                                                        } catch {}
+                                                    },
+                                                    onClick: e => { e.stopPropagation(); handlePlayerTap(p, i); },
+                                                } : {};
+                                                return (
+                                                    <div
+                                                        key={`${i}-${playerIdx}-${p}`}
+                                                        className={`team-player ${isSelected ? "selected" : ""}`}
+                                                        style={canMovePlayers ? undefined : { cursor: "default" }}
+                                                        {...playerHandlers}
+                                                    >
+                                                        <span>{p}</span>
+                                                    </div>
+                                                );
+                                            })}
+                                        </div>
+                                    </div>
+                                );
+                            })}
+                        </div>
+                        {canMovePlayers ? (
+                            <p className="help-text">
+                                Drag a player onto another player to place them at that exact spot (works within the same team too). Drop on empty team space to add to the end. On mobile: tap a player, then tap another player to swap, or tap a team card to move to its end.
+                            </p>
+                        ) : hasMatches && canEdit ? (
+                            <p className="help-text">Teams are locked because matches have been recorded. Start a new round from the Roster tab to reshuffle.</p>
+                        ) : null}
+                        {canEdit && (
+                            <div className="btn-row">
+                                {!finalized ? (
+                                    <button className="btn" onClick={toggleFinalize}>
+                                        Finalize teams · Publish
+                                    </button>
+                                ) : (
+                                    <button className="btn btn-secondary" onClick={toggleFinalize}>
+                                        Edit teams (unpublish)
+                                    </button>
+                                )}
+                            </div>
+                        )}
+                        {canEdit && !finalized && (
+                            <p className="help-text">Only you can see these teams. Tap <strong>Finalize teams · Publish</strong> to make them visible to everyone.</p>
+                        )}
+                    </>
+                )}
+            </div>
+
+            {rounds.length > 0 && (
+                <div className="card">
+                    <h2>Past Rounds ({rounds.length})</h2>
+                    <div className="history-list">
+                        {[...rounds].reverse().map(round => {
+                            const standings = computeStandings(round.teams, round.matches);
+                            const winner = standings[0]?.played > 0 ? standings[0].team : null;
+                            const expanded = expandedRoundId === round.id;
+                            return (
+                                <div key={round.id}>
+                                    <div
+                                        className="history-row"
+                                        onClick={() => setExpandedRoundId(expanded ? null : round.id)}
+                                    >
+                                        <div className="history-name">{formatDate(round.date)}</div>
+                                        <div className="history-meta">
+                                            {round.teams.length} teams · {round.matches.length} match{round.matches.length === 1 ? "" : "es"}
+                                        </div>
+                                        <div className="history-winner">
+                                            {winner ? <>🏆 <strong>{winner.name}</strong></> : <span className="muted">No winner</span>}
+                                        </div>
+                                    </div>
+                                    {expanded && (
+                                        <div style={{ padding: "0.5rem 0 1rem" }}>
+                                            {canEdit && (
+                                                <div className="btn-row" style={{ marginBottom: "0.75rem" }}>
+                                                    <button
+                                                        className="btn btn-danger"
+                                                        onClick={() => {
+                                                            if (!confirm("Delete this round's history?")) return;
+                                                            patchTournament(t => ({
+                                                                ...t,
+                                                                rounds: (t.rounds || []).filter(r => r.id !== round.id),
+                                                            }));
+                                                            setExpandedRoundId(null);
+                                                        }}
+                                                    >Delete this round</button>
+                                                </div>
+                                            )}
+                                            <StandingsTable standings={standings} teams={round.teams} />
+                                            {round.matches.length > 0 && (
+                                                <>
+                                                    <h3 style={{ marginTop: "1rem" }}>Matches</h3>
+                                                    <div className="match-list">
+                                                        {[...round.matches].reverse().map((m, i) => (
+                                                            <TournamentMatchCard
+                                                                key={m.id || i}
+                                                                match={m}
+                                                                teams={round.teams}
+                                                                index={round.matches.length - 1 - i}
+                                                            />
+                                                        ))}
+                                                    </div>
+                                                </>
+                                            )}
+                                        </div>
+                                    )}
+                                </div>
+                            );
+                        })}
+                    </div>
+                </div>
+            )}
+        </>
+    );
+}
+
+function RosterTournamentCard({ tournament, patchTournament, disabled, showToast, rosterTemplates, setRosterTemplates }) {
+    const members = tournament.rosterMembers || [];
+    const availableIds = tournament.availableIds || [];
+    const teams = tournament.teams || [];
+    const hasMatches = (tournament.matches || []).length > 0;
+    const canEdit = !disabled;
+    const canManageTemplates = typeof setRosterTemplates === "function";
+    const templates = rosterTemplates || [];
+
+    const [name, setName] = useState("");
+    const [category, setCategory] = useState(3);
+    const [filter, setFilter] = useState("all");
+    // Saved template id to seed/replace from (null when no templates exist).
+    const [seedChoice, setSeedChoice] = useState(templates[0]?.id || "");
+
+    // Non-admin view: alphabetical roster names only. The Teams tab is where
+    // generated teams and past rounds show up for everyone.
+    if (!canEdit) {
+        const alphabetical = [...members].sort((a, b) => a.name.localeCompare(b.name));
+        return (
+            <div className="card">
+                <h2>Roster ({members.length})</h2>
+                {members.length === 0 ? (
+                    <div className="empty">No players yet.</div>
+                ) : (
+                    <div className="member-list">
+                        {alphabetical.map(m => (
+                            <div key={m.id} className="member-row">
+                                <span className="member-name">{m.name}</span>
+                            </div>
+                        ))}
+                    </div>
+                )}
+            </div>
+        );
+    }
+
+    const addMember = () => {
+        if (!canEdit) return;
+        const trimmed = name.trim();
+        if (!trimmed) return;
+        if (members.some(m => m.name.toLowerCase() === trimmed.toLowerCase())) {
+            alert("A player with that name is already in the roster.");
+            return;
+        }
+        const nextRank = Math.max(0, ...members.filter(m => m.category === category).map(m => m.rank || 0)) + 1;
+        const newMember = { id: uid(), name: trimmed, category, rank: nextRank };
+        patchTournament(t => ({
+            ...t,
+            rosterMembers: [...(t.rosterMembers || []), newMember],
+            availableIds: [...(t.availableIds || []), newMember.id],
+        }));
+        setName("");
+    };
+
+    const updateMember = (id, field, value) => {
+        if (!canEdit) return;
+        patchTournament(t => ({
+            ...t,
+            rosterMembers: (t.rosterMembers || []).map(m => m.id === id ? { ...m, [field]: value } : m),
+        }));
+    };
+
+    const removeMember = (id) => {
+        if (!canEdit) return;
+        const m = members.find(x => x.id === id);
+        if (!m) return;
+        if (!confirm(`Remove ${m.name} from the roster?`)) return;
+        patchTournament(t => ({
+            ...t,
+            rosterMembers: (t.rosterMembers || []).filter(x => x.id !== id),
+            availableIds: (t.availableIds || []).filter(x => x !== id),
+        }));
+    };
+
+    const toggleOut = (id) => {
+        if (!canEdit) return;
+        patchTournament(t => {
+            const current = t.availableIds || [];
+            const next = current.includes(id) ? current.filter(x => x !== id) : [...current, id];
+            return { ...t, availableIds: next };
+        });
+    };
+
+    const markAllIn = () => {
+        if (!canEdit) return;
+        patchTournament(t => ({ ...t, availableIds: (t.rosterMembers || []).map(m => m.id) }));
+    };
+
+    const markAllOut = () => {
+        if (!canEdit) return;
+        patchTournament(t => ({ ...t, availableIds: [] }));
+    };
+
+    // Load a saved template into the current tournament's roster. New ids keep
+    // the loaded members independent from the template (and from any past-round
+    // player ids inside the tournament).
+    const seedFromChoice = (choice) => {
+        if (!canEdit) return;
+        const tpl = templates.find(x => x.id === choice);
+        if (!tpl) return;
+        const source = tpl.members.map(m => ({
+            id: uid(),
+            name: m.name,
+            category: m.category,
+            rank: m.rank,
+        }));
+        const label = `"${tpl.name}"`;
+        if (members.length > 0 && !confirm(`Replace the current roster with ${label}?`)) return;
+        patchTournament(t => ({
+            ...t,
+            rosterMembers: source,
+            availableIds: source.map(m => m.id),
+        }));
+        showToast?.(`Loaded ${label}`);
+    };
+
+    const saveAsTemplate = () => {
+        if (!canManageTemplates) return;
+        if (members.length === 0) {
+            alert("Add at least one player before saving a template.");
+            return;
+        }
+        const suggested = tournament.name || "My roster";
+        const name = (prompt("Save roster template as:", suggested) || "").trim();
+        if (!name) return;
+        const existing = templates.find(x => x.name.toLowerCase() === name.toLowerCase());
+        if (existing && !confirm(`"${name}" already exists. Overwrite it?`)) return;
+        // Snapshot current members with fresh ids so template is independent.
+        const snapshot = members.map(m => ({
+            id: uid(),
+            name: m.name,
+            category: m.category,
+            rank: m.rank,
+        }));
+        setRosterTemplates(prev => {
+            const list = prev || [];
+            if (existing) {
+                return list.map(x => x.id === existing.id ? { ...x, members: snapshot } : x);
+            }
+            return [...list, { id: uid(), name, members: snapshot }];
+        });
+        showToast?.(`Saved "${name}"`);
+    };
+
+    const deleteTemplate = (templateId) => {
+        if (!canManageTemplates) return;
+        const tpl = templates.find(x => x.id === templateId);
+        if (!tpl) return;
+        if (!confirm(`Delete saved roster "${tpl.name}"?`)) return;
+        setRosterTemplates(prev => (prev || []).filter(x => x.id !== templateId));
+        if (seedChoice === templateId) {
+            const remaining = templates.filter(x => x.id !== templateId);
+            setSeedChoice(remaining[0]?.id || "");
+        }
+        showToast?.(`Deleted "${tpl.name}"`);
+    };
+
+    const generateTeams = () => {
+        if (!canEdit) return;
+        const available = members.filter(m => availableIds.includes(m.id));
+        if (available.length < 3) return;
+        // Reshuffling after matches have been recorded = starting a new round.
+        // Archive the current teams + matches so they are not lost.
+        if (hasMatches) {
+            if (!confirm("Start a new round? The current round's matches will be moved to Past Rounds.")) return;
+        }
+        const numTeams = available.length >= 17 ? 3 : 2;
+        const teamArrays = generateBalancedTeams(available, numTeams);
+        const generated = teamArrays.map((team, i) => ({
+            id: uid(),
+            name: `Team ${String.fromCharCode(65 + i)}`,
+            players: team.map(p => p.name),
+        }));
+        patchTournament(t => {
+            const nextRounds = (t.matches || []).length > 0
+                ? [...(t.rounds || []), {
+                    id: uid(),
+                    date: t.date || todayISO(),
+                    teams: t.teams || [],
+                    matches: t.matches || [],
+                }]
+                : (t.rounds || []);
+            return {
+                ...t,
+                date: todayISO(),
+                rounds: nextRounds,
+                teams: generated,
+                matches: [],
+                activeMatches: {},
+                teamsFinalized: false,
+            };
+        });
+        showToast?.(hasMatches ? "New round started" : `${numTeams} teams generated`);
+    };
+
+    const grouped = { 1: [], 2: [], 3: [] };
+    members.forEach(m => { grouped[m.category || 3].push(m); });
+    Object.values(grouped).forEach(list => list.sort((a, b) => (a.rank || 999) - (b.rank || 999)));
+
+    const availablePlayers = members.filter(m => availableIds.includes(m.id));
+    const breakdown = { 1: 0, 2: 0, 3: 0 };
+    availablePlayers.forEach(p => breakdown[p.category || 3]++);
+
+    const visible = members
+        .filter(m => filter === "all" || m.category === Number(filter))
+        .sort((a, b) => {
+            if (a.category !== b.category) return a.category - b.category;
+            return (a.rank || 999) - (b.rank || 999);
+        });
+
+    return (
+        <>
+            {canEdit && (
+                <div className="card">
+                    <h2>Add Player</h2>
+                    <div className="row">
+                        <input
+                            type="text"
+                            value={name}
+                            placeholder="Player name"
+                            onChange={e => setName(e.target.value)}
+                            onKeyDown={e => e.key === "Enter" && addMember()}
+                        />
+                        <select value={category} onChange={e => setCategory(Number(e.target.value))}>
+                            <option value={1}>Category 1</option>
+                            <option value={2}>Category 2</option>
+                            <option value={3}>Category 3</option>
+                        </select>
+                        <button className="btn" onClick={addMember}>Add</button>
+                    </div>
+                    {members.length === 0 && (
+                        <div className="roster-seed">
+                            {templates.length > 0 ? (
+                                <>
+                                    <label className="roster-seed-label">Or load a saved roster:</label>
+                                    <div className="row">
+                                        <select
+                                            value={seedChoice}
+                                            onChange={e => setSeedChoice(e.target.value)}
+                                        >
+                                            {templates.map(tpl => (
+                                                <option key={tpl.id} value={tpl.id}>
+                                                    {tpl.name} ({tpl.members.length})
+                                                </option>
+                                            ))}
+                                        </select>
+                                        <button className="btn btn-secondary" onClick={() => seedFromChoice(seedChoice)}>Load</button>
+                                    </div>
+                                </>
+                            ) : (
+                                <p className="help-text" style={{ marginTop: 0 }}>
+                                    Add players above. Once you have a roster you like, use <strong>💾 Save as template</strong> to reuse it for future tournaments.
+                                </p>
+                            )}
+                        </div>
+                    )}
+                </div>
+            )}
+
+            <div className="card">
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "0.5rem", flexWrap: "wrap", gap: "0.5rem" }}>
+                    <h2 style={{ margin: 0 }}>Roster ({members.length})</h2>
+                    {canEdit && members.length > 0 && (
+                        <div className="roster-tool-row">
+                            {canManageTemplates && (
+                                <button className="btn btn-secondary" onClick={saveAsTemplate} title="Save this roster as a reusable template">
+                                    💾 Save as template
+                                </button>
+                            )}
+                            {templates.length > 0 && (
+                                <>
+                                    <select
+                                        value={seedChoice}
+                                        onChange={e => setSeedChoice(e.target.value)}
+                                        title="Pick a saved roster to replace with"
+                                    >
+                                        {templates.map(tpl => (
+                                            <option key={tpl.id} value={tpl.id}>
+                                                {tpl.name} ({tpl.members.length})
+                                            </option>
+                                        ))}
+                                    </select>
+                                    <button className="btn btn-secondary" onClick={() => seedFromChoice(seedChoice)}>Replace</button>
+                                    {canManageTemplates && seedChoice && (
+                                        <button
+                                            className="btn btn-secondary danger"
+                                            onClick={() => deleteTemplate(seedChoice)}
+                                            title="Delete the selected saved roster"
+                                        >Delete saved</button>
+                                    )}
+                                </>
+                            )}
+                        </div>
+                    )}
+                </div>
+
+                {members.length === 0 ? (
+                    <div className="empty">No players yet. Add players above or seed the preset roster.</div>
+                ) : (
+                    <>
+                        <div className="stats-bar">
+                            <div className="stat"><div className="num">{availablePlayers.length}</div><div className="label">In</div></div>
+                            <div className="stat c1"><div className="num">{breakdown[1]}</div><div className="label">Cat 1</div></div>
+                            <div className="stat c2"><div className="num">{breakdown[2]}</div><div className="label">Cat 2</div></div>
+                            <div className="stat c3"><div className="num">{breakdown[3]}</div><div className="label">Cat 3</div></div>
+                            <div className="stat danger"><div className="num">{members.length - availablePlayers.length}</div><div className="label">Out</div></div>
+                        </div>
+
+                        <div className="filter-bar">
+                            {["all", "1", "2", "3"].map(f => (
+                                <button
+                                    key={f}
+                                    className={`filter-btn ${filter === f ? "active" : ""}`}
+                                    onClick={() => setFilter(f)}
+                                >
+                                    {f === "all" ? "All" : `Category ${f}`}
+                                </button>
+                            ))}
+                            {canEdit && <button className="filter-btn" onClick={markAllIn}>Everyone in</button>}
+                            {canEdit && <button className="filter-btn" onClick={markAllOut}>Everyone out</button>}
+                        </div>
+
+                        {canEdit && <h3>Tap players who are NOT playing</h3>}
+                        <div className="member-list">
+                            {visible.map(m => {
+                                const isOut = !availableIds.includes(m.id);
+                                return (
+                                    <div
+                                        key={m.id}
+                                        className={`member-row ${canEdit ? "selectable" : ""} ${isOut ? "out" : ""}`}
+                                        onClick={canEdit ? () => toggleOut(m.id) : undefined}
+                                    >
+                                        {canEdit && <div className="checkbox">{isOut && "✕"}</div>}
+                                        <span className="member-name">{m.name}</span>
+                                        <CatBadge category={m.category} rank={m.rank} />
+                                        {canEdit && (
+                                            <>
+                                                <select
+                                                    value={m.category}
+                                                    onChange={e => { e.stopPropagation(); updateMember(m.id, "category", Number(e.target.value)); }}
+                                                    onClick={e => e.stopPropagation()}
+                                                    style={{ minWidth: "90px" }}
+                                                >
+                                                    <option value={1}>Cat 1</option>
+                                                    <option value={2}>Cat 2</option>
+                                                    <option value={3}>Cat 3</option>
+                                                </select>
+                                                <button
+                                                    className="icon-btn"
+                                                    onClick={e => { e.stopPropagation(); removeMember(m.id); }}
+                                                    title="Remove from roster"
+                                                >✕</button>
+                                            </>
+                                        )}
+                                    </div>
+                                );
+                            })}
+                        </div>
+
+                        {canEdit && (
+                            <div className="btn-row">
+                                <button
+                                    className="btn"
+                                    onClick={generateTeams}
+                                    disabled={availablePlayers.length < 3}
+                                >
+                                    {hasMatches
+                                        ? "Start new round · Reshuffle"
+                                        : (teams.length > 0 ? "Reshuffle Teams" : "Generate Teams")}
+                                </button>
+                            </div>
+                        )}
+                        {canEdit && availablePlayers.length < 3 && (
+                            <p className="help-text">Need at least 3 available players to form teams.</p>
+                        )}
+                        {canEdit && hasMatches && (
+                            <p className="help-text">The current round has matches. Reshuffling will archive them to <strong>Past Rounds</strong> and start a fresh round with the same roster.</p>
+                        )}
+                    </>
+                )}
+            </div>
+
+        </>
+    );
+}
+
 function TournamentScoreboard({ tournament, patchTournament, showToast, scorerKey }) {
     const teams = tournament.teams || [];
 
@@ -1850,6 +2553,19 @@ function TournamentScoreboard({ tournament, patchTournament, showToast, scorerKe
             <div className="card">
                 <h2>Record Match</h2>
                 <div className="empty">Add at least two teams to start recording matches.</div>
+            </div>
+        );
+    }
+
+    // Roster-kind: can't start scoring until the admin has finalized the teams,
+    // otherwise viewers would see a live match whose teams are still a draft.
+    if (tournament.kind === TOURNAMENT_KIND_ROSTER && tournament.teamsFinalized === false) {
+        return (
+            <div className="card">
+                <h2>Record Match</h2>
+                <div className="empty">
+                    Finalize the teams first (Teams tab → <strong>Finalize teams · Publish</strong>). Matches can't start on draft teams.
+                </div>
             </div>
         );
     }
@@ -1896,11 +2612,20 @@ function TournamentScoreboard({ tournament, patchTournament, showToast, scorerKe
     const toMM = Math.floor(timeoutT.remainingSec / 60);
     const toSS = timeoutT.remainingSec % 60;
 
+    // Always seed teamAId/teamBId so the Live view can pick this slot up as
+    // soon as the scorer starts the timer (not just when they bump a score).
+    // Existing stored ids take precedence over the local defaults; the explicit
+    // `patch` wins over both.
     const setActive = (patch) => patchTournament(t => ({
         ...t,
         activeMatches: {
             ...(t.activeMatches || {}),
-            [slotKey]: { ...((t.activeMatches && t.activeMatches[slotKey]) || {}), ...patch },
+            [slotKey]: {
+                teamAId,
+                teamBId,
+                ...((t.activeMatches && t.activeMatches[slotKey]) || {}),
+                ...patch,
+            },
         },
     }));
 
@@ -2108,8 +2833,12 @@ function TournamentScoreboard({ tournament, patchTournament, showToast, scorerKe
                         </span>
                     </div>
                     <div className="timeout-banner-actions">
-                        <button className="btn btn-secondary" onClick={stopTimeout} title="End timeout without restarting the match timer">Stop</button>
-                        <button className="btn" onClick={endTimeout}>End timeout &amp; resume</button>
+                        <button className="btn" onClick={endTimeout}>End timeout</button>
+                        <button
+                            className="btn btn-secondary emergency-btn"
+                            onClick={stopTimeout}
+                            title="Emergency: end timeout WITHOUT restarting the match timer (use only if the match can't resume — injury, equipment issue, etc.)"
+                        >⚠ Emergency: end without resuming</button>
                     </div>
                 </div>
             )}
@@ -2327,7 +3056,45 @@ function TournamentMatchCard({ match, teams, index, canDelete, onDelete }) {
     );
 }
 
-function TournamentView({ tournaments, setTournaments, showToast, canManage, canScore, tournamentTab, setTournamentTab, selectedTournamentId, setSelectedTournamentId, scorerKey }) {
+function KindChooserCard({ onPick, onCancel }) {
+    return (
+        <div className="card kind-chooser">
+            <h2>What kind of tournament?</h2>
+            <p className="help-text" style={{ marginTop: 0 }}>
+                Pick how teams will be formed. You can create more of either kind later.
+            </p>
+            <div className="kind-grid">
+                <button
+                    className="kind-option"
+                    onClick={() => onPick(TOURNAMENT_KIND_ROSTER)}
+                >
+                    <span className="kind-option-icon" aria-hidden="true">🎲</span>
+                    <span className="kind-option-title">Roster · AI teams</span>
+                    <span className="kind-option-desc">
+                        Build a roster of players (categories &amp; ranks). AI generates balanced
+                        teams from everyone marked available. Best for weekly games.
+                    </span>
+                </button>
+                <button
+                    className="kind-option"
+                    onClick={() => onPick(TOURNAMENT_KIND_TEAMS)}
+                >
+                    <span className="kind-option-icon" aria-hidden="true">🏆</span>
+                    <span className="kind-option-title">Preset teams</span>
+                    <span className="kind-option-desc">
+                        Add teams directly (e.g. one per state) and record matches between them.
+                        Best for a big tournament with fixed rosters.
+                    </span>
+                </button>
+            </div>
+            <div className="btn-row">
+                <button className="btn btn-secondary" onClick={onCancel}>Cancel</button>
+            </div>
+        </div>
+    );
+}
+
+function TournamentView({ tournaments, setTournaments, rosterTemplates, setRosterTemplates, showToast, canManage, canScore, tournamentTab, setTournamentTab, selectedTournamentId, setSelectedTournamentId, scorerKey }) {
     const selectedId = selectedTournamentId && tournaments.some(t => t.id === selectedTournamentId)
         ? selectedTournamentId
         : (tournaments[tournaments.length - 1]?.id || null);
@@ -2342,18 +3109,25 @@ function TournamentView({ tournaments, setTournaments, showToast, canManage, can
         setTournaments(prev => prev.map(t => t.id === activeTournament.id ? updater(t) : t));
     };
 
-    const createTournament = () => {
-        const name = (prompt("Tournament name:") || "").trim();
+    const [picking, setPicking] = useState(false);
+
+    const createTournament = (kind) => {
+        const label = kind === TOURNAMENT_KIND_ROSTER ? "Roster tournament" : "Team tournament";
+        const name = (prompt(`${label} name:`) || "").trim();
         if (!name) return;
         if (tournaments.some(t => t.name.toLowerCase() === name.toLowerCase())) {
             alert("A tournament with that name already exists.");
             return;
         }
-        const t = makeTournament(name);
+        const t = makeTournament(name, kind);
         setTournaments(prev => [...prev, t]);
         setSelectedId(t.id);
-        showToast?.(`Tournament "${name}" created`);
+        setTournamentTab(kind === TOURNAMENT_KIND_ROSTER ? "roster" : "teams");
+        setPicking(false);
+        showToast?.(`${label} "${name}" created`);
     };
+
+    const startCreate = () => setPicking(true);
 
     const renameTournament = () => {
         if (!activeTournament) return;
@@ -2404,15 +3178,23 @@ function TournamentView({ tournaments, setTournaments, showToast, canManage, can
 
     if (!activeTournament) {
         return (
-            <div className="card">
-                <h2>Tournaments</h2>
-                <div className="empty">No tournaments yet.</div>
-                {canManage && (
-                    <div className="btn-row">
-                        <button className="btn" onClick={createTournament}>+ Create Tournament</button>
-                    </div>
+            <>
+                <div className="card">
+                    <h2>Tournaments</h2>
+                    <div className="empty">No tournaments yet.</div>
+                    {canManage && !picking && (
+                        <div className="btn-row">
+                            <button className="btn" onClick={startCreate}>+ Create Tournament</button>
+                        </div>
+                    )}
+                </div>
+                {canManage && picking && (
+                    <KindChooserCard
+                        onPick={createTournament}
+                        onCancel={() => setPicking(false)}
+                    />
                 )}
-            </div>
+            </>
         );
     }
 
@@ -2430,9 +3212,12 @@ function TournamentView({ tournaments, setTournaments, showToast, canManage, can
 
     const otherTournaments = tournaments.filter(t => t.id !== activeTournament.id);
     const canRecord = !ended && (canManage || canScore);
+    const isRoster = activeTournament.kind === TOURNAMENT_KIND_ROSTER;
     const tabs = [
         { key: "standings", label: "Standings" },
-        { key: "teams", label: "Teams" },
+        ...(isRoster
+            ? [{ key: "roster", label: "Roster" }, { key: "teams", label: "Teams" }]
+            : [{ key: "teams", label: "Teams" }]),
         { key: "fixtures", label: "Fixtures" },
         ...(canRecord ? [{ key: "score", label: "Score" }] : []),
         { key: "matches", label: `Matches (${played})` },
@@ -2443,6 +3228,12 @@ function TournamentView({ tournaments, setTournaments, showToast, canManage, can
 
     return (
         <div>
+            {canManage && picking && (
+                <KindChooserCard
+                    onPick={createTournament}
+                    onCancel={() => setPicking(false)}
+                />
+            )}
             {canManage && (
                 <div className="roster-bar tournament-admin-bar">
                     {tournaments.length > 1 ? (
@@ -2457,7 +3248,7 @@ function TournamentView({ tournaments, setTournaments, showToast, canManage, can
                     ) : (
                         <span className="roster-name-static">{activeTournament.name}</span>
                     )}
-                    <button className="btn btn-secondary" onClick={createTournament}>+ New</button>
+                    <button className="btn btn-secondary" onClick={startCreate}>+ New</button>
                     <button className="btn btn-secondary" onClick={renameTournament}>Rename</button>
                     {ended ? (
                         <button className="btn btn-secondary" onClick={reopenTournament}>Reopen</button>
@@ -2495,6 +3286,9 @@ function TournamentView({ tournaments, setTournaments, showToast, canManage, can
                         ) : (
                             <span className="tournament-date">{formatDate(activeTournament.date)}</span>
                         )}
+                        <span className={`kind-badge kind-${isRoster ? "roster" : "teams"}`}>
+                            {isRoster ? "Roster · AI teams" : "Preset teams"}
+                        </span>
                         {ended && <span className="ended-badge">Ended</span>}
                     </div>
                 </div>
@@ -2564,7 +3358,7 @@ function TournamentView({ tournaments, setTournaments, showToast, canManage, can
                 </div>
             )}
 
-            {currentTab === "teams" && (
+            {currentTab === "teams" && !isRoster && (
                 canManage ? (
                     <TeamsManagerCard
                         tournament={activeTournament}
@@ -2575,6 +3369,25 @@ function TournamentView({ tournaments, setTournaments, showToast, canManage, can
                 ) : (
                     <PublicTeamsCard tournament={activeTournament} />
                 )
+            )}
+
+            {currentTab === "roster" && isRoster && (
+                <RosterTournamentCard
+                    tournament={activeTournament}
+                    patchTournament={patchTournament}
+                    disabled={ended || !canManage}
+                    showToast={showToast}
+                    rosterTemplates={rosterTemplates}
+                    setRosterTemplates={canManage ? setRosterTemplates : null}
+                />
+            )}
+
+            {currentTab === "teams" && isRoster && (
+                <RosterTeamsCard
+                    tournament={activeTournament}
+                    patchTournament={patchTournament}
+                    disabled={ended || !canManage}
+                />
             )}
 
             {currentTab === "fixtures" && (
@@ -2622,12 +3435,9 @@ function TournamentView({ tournaments, setTournaments, showToast, canManage, can
     );
 }
 
-function LiveView({ activeRoster, tournaments, onViewTournament }) {
-    const members = activeRoster?.members || [];
-    const session = activeRoster?.currentSession;
+function LiveView({ tournaments, setTournaments, onViewTournament, showToast }) {
     const tournamentList = tournaments || [];
-
-    const hasWeeklyMatch = !!session?.teams && Array.isArray(session.teams) && session.teams.length >= 2 && session.teamsFinalized === true;
+    const canManage = typeof setTournaments === "function";
 
     // A match is "live" once the scorer has done something — bumped a score,
     // started the timer, or called a timeout. Pre-match defaults (teams picked
@@ -2642,12 +3452,46 @@ function LiveView({ activeRoster, tournaments, onViewTournament }) {
         return false;
     };
 
+    // Clears a stuck active-match slot without recording a match. Used when the
+    // scorer forgot to tap "End Match" and the row stays live forever.
+    const dismissSlot = (tournamentId, slotKey) => {
+        if (!canManage) return;
+        if (!confirm("Clear this live match? Any un-ended score will be discarded (nothing is recorded).")) return;
+        setTournaments(prev => prev.map(t => {
+            if (t.id !== tournamentId) return t;
+            const nextActive = { ...(t.activeMatches || {}) };
+            delete nextActive[slotKey];
+            return { ...t, activeMatches: nextActive };
+        }));
+        showToast?.("Live match cleared");
+    };
+
+    // Patch a single active-match slot (used for Pause/Resume from the Live
+    // view). Admin/scorer only.
+    const patchSlot = (tournamentId, slotKey, patch) => {
+        if (!canManage) return;
+        setTournaments(prev => prev.map(t => {
+            if (t.id !== tournamentId) return t;
+            const existing = (t.activeMatches && t.activeMatches[slotKey]) || {};
+            return {
+                ...t,
+                activeMatches: {
+                    ...(t.activeMatches || {}),
+                    [slotKey]: { ...existing, ...patch },
+                },
+            };
+        }));
+    };
+
     // Group live matches by tournament so each tournament renders ONE card
     // (even if several of its courts are live), with the recent-matches list
     // and View Tournament button appearing once per tournament.
     const liveTournaments = [];
     tournamentList.forEach(t => {
         if (t.endedAt) return;
+        // Roster-kind tournaments whose teams aren't published yet shouldn't
+        // show live matches to anyone (viewers would see draft team names).
+        if (t.kind === TOURNAMENT_KIND_ROSTER && t.teamsFinalized === false) return;
         const activeMatches = t.activeMatches || {};
         const slots = [];
         Object.entries(activeMatches).forEach(([key, m]) => {
@@ -2660,7 +3504,7 @@ function LiveView({ activeRoster, tournaments, onViewTournament }) {
         if (slots.length > 0) liveTournaments.push({ tournament: t, slots });
     });
 
-    if (!hasWeeklyMatch && liveTournaments.length === 0) {
+    if (liveTournaments.length === 0) {
         return (
             <div className="card">
                 <div className="empty">
@@ -2672,15 +3516,14 @@ function LiveView({ activeRoster, tournaments, onViewTournament }) {
 
     return (
         <div>
-            {hasWeeklyMatch && (
-                <WeeklyLiveCard session={session} members={members} roster={activeRoster} />
-            )}
             {liveTournaments.map(({ tournament, slots }) => (
                 <TournamentLiveCard
                     key={tournament.id}
                     tournament={tournament}
                     slots={slots}
                     onViewTournament={onViewTournament}
+                    onDismissSlot={canManage ? (slotKey) => dismissSlot(tournament.id, slotKey) : null}
+                    onPatchSlot={canManage ? (slotKey, patch) => patchSlot(tournament.id, slotKey, patch) : null}
                 />
             ))}
         </div>
@@ -2703,24 +3546,34 @@ function LiveTimerDisplay({ state, matchDurationMin, timeoutDurationMin, timeout
     const ss = match.remainingSec % 60;
     const toMM = Math.floor(toT.remainingSec / 60);
     const toSS = toT.remainingSec % 60;
-    const isTimeout = !!timeoutTeam && !!timeoutColor;
-    const tileStyle = isTimeout ? {
+
+    // Match timer is always shown. If a timeout is in progress the match
+    // timer is paused and the timeout timer appears alongside it.
+    const matchLabel = running ? "Live" : (match.elapsedSec > 0 ? "Paused" : "Pre-match");
+    const matchClass = match.expired ? "expired" : (running ? "running" : (match.elapsedSec > 0 ? "paused" : "pre"));
+    const showTimeout = !!timeoutTeam;
+    const timeoutStyle = timeoutColor ? {
         borderColor: timeoutColor,
         background: `${timeoutColor}1a`,
     } : undefined;
-    const textStyle = isTimeout ? { color: timeoutColor } : undefined;
+    const timeoutTextStyle = timeoutColor ? { color: timeoutColor } : undefined;
+
     return (
-        <div className={`live-timer-row${match.expired ? " expired" : ""}${isTimeout ? " timeout" : ""}`}>
-            <div className="live-timer" style={tileStyle}>
-                <span className="live-timer-label" style={textStyle}>
-                    {timeoutTeam ? "Timeout" : (running ? "Live" : (match.elapsedSec > 0 ? "Paused" : "Pre-match"))}
-                </span>
-                <span className="live-timer-value" style={textStyle}>
-                    {timeoutTeam
-                        ? `${toMM}:${toSS.toString().padStart(2, "0")}`
-                        : `${mm}:${ss.toString().padStart(2, "0")}`}
+        <div className={`live-timer-row${match.expired ? " expired" : ""}${showTimeout ? " with-timeout" : ""}`}>
+            <div className={`live-timer live-timer-main ${matchClass}`}>
+                <span className="live-timer-label">{matchLabel}</span>
+                <span className="live-timer-value">
+                    {mm}:{ss.toString().padStart(2, "0")}
                 </span>
             </div>
+            {showTimeout && (
+                <div className="live-timer live-timer-timeout" style={timeoutStyle}>
+                    <span className="live-timer-label" style={timeoutTextStyle}>Timeout</span>
+                    <span className="live-timer-value" style={timeoutTextStyle}>
+                        {toMM}:{toSS.toString().padStart(2, "0")}
+                    </span>
+                </div>
+            )}
         </div>
     );
 }
@@ -2862,14 +3715,87 @@ function TournamentLiveMatch({ tournament, match: am }) {
     );
 }
 
-function TournamentLiveCard({ tournament, slots, onViewTournament }) {
+// Compact single-row summary for one live match. Shown in the collapsed Live
+// card so the Live tab is a quick glance across tournaments.
+function LiveMatchSummary({ tournament, match: am }) {
+    const teams = tournament.teams || [];
+    const a = teams.find(t => t.id === am.teamAId);
+    const b = teams.find(t => t.id === am.teamBId);
+    if (!a || !b) return null;
+    const aIdx = teams.findIndex(t => t.id === am.teamAId);
+    const bIdx = teams.findIndex(t => t.id === am.teamBId);
+    const colorA = teamColor(aIdx);
+    const colorB = teamColor(bIdx);
+    const scoreA = am.scoreA || 0;
+    const scoreB = am.scoreB || 0;
+
+    const matchDurationMin = tournament.matchDurationMin || DEFAULT_MATCH_MIN;
+    const timeoutDurationMin = tournament.timeoutDurationMin || DEFAULT_TIMEOUT_MIN;
+    const running = !!am.timerRunning;
+    const timeoutTeam = am.timeoutTeam || null;
+    const [now, setNow] = useState(() => Date.now());
+    useEffect(() => {
+        if (!running && !timeoutTeam) return;
+        setNow(Date.now());
+        const id = setInterval(() => setNow(Date.now()), 1000);
+        return () => clearInterval(id);
+    }, [running, timeoutTeam]);
+    const match = computeMatchTime(am, matchDurationMin, now);
+    const toT = computeTimeoutTime(am, timeoutDurationMin, now);
+    const timeStr = timeoutTeam
+        ? `${Math.floor(toT.remainingSec / 60)}:${(toT.remainingSec % 60).toString().padStart(2, "0")}`
+        : `${Math.floor(match.remainingSec / 60)}:${(match.remainingSec % 60).toString().padStart(2, "0")}`;
+    const statusLabel = timeoutTeam ? "Timeout" : (running ? "Live" : (match.elapsedSec > 0 ? "Paused" : "Pre-match"));
+
+    return (
+        <div className="live-brief">
+            <div className="live-brief-score">
+                <span className="live-brief-team" style={{ color: colorA }}>{a.name}</span>
+                <span className="live-brief-num">{scoreA}</span>
+                <span className="live-brief-dash">—</span>
+                <span className="live-brief-num">{scoreB}</span>
+                <span className="live-brief-team" style={{ color: colorB }}>{b.name}</span>
+            </div>
+            <div className="live-brief-time">
+                <span className="live-brief-status">{statusLabel}</span>
+                <span className="live-brief-clock">{timeStr}</span>
+            </div>
+        </div>
+    );
+}
+
+function TournamentLiveCard({ tournament, slots, onViewTournament, onDismissSlot, onPatchSlot }) {
     const teams = tournament.teams || [];
     const allMatches = tournament.matches || [];
     const recentMatches = allMatches.slice(-3).reverse();
     const multi = slots.length > 1;
+    const [expanded, setExpanded] = useState(false);
+    const matchDurationMin = tournament.matchDurationMin || DEFAULT_MATCH_MIN;
+
+    // Pause/Resume toggle for a specific live slot. Captures the current
+    // elapsedMs into timerAccumMs when pausing so the clock doesn't jump.
+    const toggleSlotTimer = (slotKey, am) => {
+        if (!onPatchSlot) return;
+        if (am.timerRunning) {
+            const now = Date.now();
+            const prevAccum = Number(am.timerAccumMs) || 0;
+            const liveMs = am.timerStartAt ? (now - am.timerStartAt) + prevAccum : prevAccum;
+            onPatchSlot(slotKey, { timerRunning: false, timerStartAt: null, timerAccumMs: liveMs });
+        } else {
+            onPatchSlot(slotKey, { timerRunning: true, timerStartAt: Date.now() });
+        }
+    };
+
     return (
-        <div className="card">
-            <div className="live-head">
+        <div className={`card live-card ${expanded ? "expanded" : "collapsed"}`}>
+            <div
+                className="live-head live-head-clickable"
+                onClick={() => setExpanded(x => !x)}
+                role="button"
+                tabIndex={0}
+                onKeyDown={e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setExpanded(x => !x); } }}
+                aria-expanded={expanded}
+            >
                 <span className="live-badge"><span className="live-dot"></span>LIVE</span>
                 <div className="live-title">
                     <h2>{tournament.name}</h2>
@@ -2878,34 +3804,88 @@ function TournamentLiveCard({ tournament, slots, onViewTournament }) {
                         {multi && ` · ${slots.length} courts live`}
                     </span>
                 </div>
+                <span className="live-chevron" aria-hidden="true">{expanded ? "▾" : "▸"}</span>
             </div>
-            {slots.map(({ match, slotKey }, i) => (
-                <React.Fragment key={slotKey}>
-                    {i > 0 && <div className="live-match-divider" />}
-                    <TournamentLiveMatch tournament={tournament} match={match} />
-                </React.Fragment>
-            ))}
-            {recentMatches.length > 0 && (
-                <>
-                    <h3 className="live-section-title">Last {recentMatches.length} match{recentMatches.length === 1 ? "" : "es"}</h3>
-                    <div className="match-list">
-                        {recentMatches.map((m, i) => (
-                            <TournamentMatchCard
-                                key={m.id || i}
-                                match={m}
-                                teams={teams}
-                                index={allMatches.length - 1 - i}
-                            />
-                        ))}
-                    </div>
-                </>
-            )}
-            {onViewTournament && (
-                <div className="btn-row">
-                    <button className="btn" onClick={() => onViewTournament(tournament.id)}>
-                        View Tournament →
-                    </button>
+
+            {!expanded && (
+                <div className="live-brief-list">
+                    {slots.map(({ match, slotKey }) => (
+                        <LiveMatchSummary key={slotKey} tournament={tournament} match={match} />
+                    ))}
                 </div>
+            )}
+
+            {expanded && (
+                <>
+                    {slots.map(({ match: am, slotKey }, i) => {
+                        const running = !!am.timerRunning;
+                        const elapsed = (Number(am.timerAccumMs) || 0) > 0 || running;
+                        return (
+                            <React.Fragment key={slotKey}>
+                                {i > 0 && <div className="live-match-divider" />}
+                                <TournamentLiveMatch tournament={tournament} match={am} />
+                                {(onPatchSlot || onDismissSlot) && (
+                                    <div className="btn-row live-controls">
+                                        {onPatchSlot && (
+                                            <button
+                                                className="btn"
+                                                onClick={() => toggleSlotTimer(slotKey, am)}
+                                                disabled={!!am.timeoutTeam}
+                                                title={am.timeoutTeam ? "Match timer is paused during a timeout" : ""}
+                                            >
+                                                {running ? "⏸ Pause" : (elapsed ? "▶ Resume" : "▶ Start")}
+                                            </button>
+                                        )}
+                                        {onPatchSlot && (
+                                            <button
+                                                className="btn btn-secondary"
+                                                onClick={() => {
+                                                    if (!confirm("Reset the match timer to " + matchDurationMin + " min? Any active timeout will be cleared.")) return;
+                                                    onPatchSlot(slotKey, {
+                                                        timerRunning: false,
+                                                        timerStartAt: null,
+                                                        timerAccumMs: 0,
+                                                        timeoutTeam: null,
+                                                        timeoutStartAt: null,
+                                                    });
+                                                }}
+                                            >Reset timer</button>
+                                        )}
+                                        {onDismissSlot && (
+                                            <button
+                                                className="btn btn-secondary"
+                                                onClick={() => onDismissSlot(slotKey)}
+                                                title="Clear this live match without recording it"
+                                            >Clear live match</button>
+                                        )}
+                                    </div>
+                                )}
+                            </React.Fragment>
+                        );
+                    })}
+                    {recentMatches.length > 0 && (
+                        <>
+                            <h3 className="live-section-title">Last {recentMatches.length} match{recentMatches.length === 1 ? "" : "es"}</h3>
+                            <div className="match-list">
+                                {recentMatches.map((m, i) => (
+                                    <TournamentMatchCard
+                                        key={m.id || i}
+                                        match={m}
+                                        teams={teams}
+                                        index={allMatches.length - 1 - i}
+                                    />
+                                ))}
+                            </div>
+                        </>
+                    )}
+                    {onViewTournament && (
+                        <div className="btn-row">
+                            <button className="btn" onClick={() => onViewTournament(tournament.id)}>
+                                View Tournament →
+                            </button>
+                        </div>
+                    )}
+                </>
             )}
         </div>
     );
@@ -2914,7 +3894,7 @@ function TournamentLiveCard({ tournament, slots, onViewTournament }) {
 function App() {
     const stored = loadState();
     const initial = stored || {
-        rosters: [{ id: uid(), name: "Volleyball Group", members: seedRoster(), sessions: [], currentSession: null }],
+        rosters: [{ id: uid(), name: "Volleyball Group", members: [], sessions: [], currentSession: null }],
         activeRosterId: null,
         tournaments: [],
     };
@@ -2922,15 +3902,13 @@ function App() {
         initial.activeRosterId = initial.rosters[0].id;
     }
     if (!Array.isArray(initial.tournaments)) initial.tournaments = [];
+    if (!Array.isArray(initial.rosterTemplates)) initial.rosterTemplates = [];
 
     const [rosters, setRosters] = useState(initial.rosters);
     const [activeRosterId, setActiveRosterId] = useState(initial.activeRosterId);
     const [tournaments, setTournaments] = useState(initial.tournaments);
-    // Non-admin viewers can switch which roster they're looking at without
-    // affecting the admin's active roster. Null = follow admin's active roster.
-    const [viewingRosterId, setViewingRosterId] = useState(null);
+    const [rosterTemplates, setRosterTemplates] = useState(initial.rosterTemplates);
     const [section, setSection] = useState("live");
-    const [tab, setTab] = useState("week");
     const [tournamentTab, setTournamentTab] = useState("standings");
     const [selectedTournamentId, setSelectedTournamentId] = useState(null);
     const [toast, setToast] = useState(null);
@@ -2980,6 +3958,7 @@ function App() {
                 setRosters(normalized.rosters);
                 setActiveRosterId(normalized.activeRosterId);
                 setTournaments(normalized.tournaments || []);
+                setRosterTemplates(normalized.rosterTemplates || []);
             } else {
                 console.log("[cloud] snapshot matches local — ignored");
             }
@@ -2993,7 +3972,7 @@ function App() {
 
     // Save: localStorage always; Firestore only when signed in AS admin (debounced).
     useEffect(() => {
-        saveState({ rosters, activeRosterId, tournaments });
+        saveState({ rosters, activeRosterId, tournaments, rosterTemplates });
         const canWrite = user?.uid === ADMIN_UID || isScorerUid(user?.uid);
         if (!canWrite || !cloudReady) {
             console.log("[cloud] skip write — gate failed", {
@@ -3001,7 +3980,7 @@ function App() {
             });
             return;
         }
-        const payload = { rosters, activeRosterId, tournaments };
+        const payload = { rosters, activeRosterId, tournaments, rosterTemplates };
         const serialized = JSON.stringify(payload);
         if (serialized === lastSyncedRef.current) {
             console.log("[cloud] skip write — unchanged");
@@ -3024,7 +4003,7 @@ function App() {
                 });
         }, 500);
         return () => clearTimeout(t);
-    }, [rosters, activeRosterId, tournaments, user, cloudReady]);
+    }, [rosters, activeRosterId, tournaments, rosterTemplates, user, cloudReady]);
 
     const signIn = () => auth.signInWithPopup(googleProvider)
         .catch(err => alert("Sign-in failed: " + err.message));
@@ -3033,17 +4012,6 @@ function App() {
     const isAdmin = user?.uid === ADMIN_UID;
     const isScorer = isScorerUid(user?.uid);
 
-    // Keep the sub-tab valid for the current role. Tournament is a top-level
-    // section now, not a sub-tab, so it's not in these lists.
-    useEffect(() => {
-        const valid = isAdmin ? ["week", "members", "history"]
-                    : isScorer ? ["match", "members", "history"]
-                    : ["members", "history"];
-        if (!valid.includes(tab)) {
-            setTab(isAdmin ? "week" : isScorer ? "match" : "members");
-        }
-    }, [isAdmin, isScorer, tab]);
-
     const navigateToTournament = (tournamentId) => {
         setSelectedTournamentId(tournamentId);
         setTournamentTab("standings");
@@ -3051,67 +4019,6 @@ function App() {
     };
 
     const activeRoster = rosters.find(r => r.id === activeRosterId) || rosters[0];
-    const viewingRoster = rosters.find(r => r.id === viewingRosterId) || activeRoster;
-
-    const patchActive = (updater) => {
-        setRosters(prev => prev.map(r => r.id === activeRosterId ? updater(r) : r));
-    };
-
-    const setMembers = (members) => patchActive(r => ({ ...r, members }));
-    const setCurrentSession = (currentSession) => patchActive(r => ({ ...r, currentSession }));
-    const saveSession = (s) => patchActive(r => ({
-        ...r,
-        sessions: [...r.sessions.filter(x => x.id !== s.id), s],
-    }));
-    const deleteSession = (id) => patchActive(r => ({
-        ...r,
-        sessions: r.sessions.filter(s => s.id !== id),
-    }));
-    const resetToPreset = () => patchActive(r => ({ ...r, members: seedRoster() }));
-
-    const createRoster = () => {
-        const name = (prompt("Name for the new roster:") || "").trim();
-        if (!name) return;
-        if (rosters.some(r => r.name.toLowerCase() === name.toLowerCase())) {
-            alert("A roster with that name already exists.");
-            return;
-        }
-        const useBlank = !confirm(`Seed "${name}" with the preset 25-player list?\n(OK = seed, Cancel = start empty)`);
-        const newRoster = {
-            id: uid(),
-            name,
-            members: useBlank ? [] : seedRoster(),
-            sessions: [],
-            currentSession: null,
-        };
-        setRosters([...rosters, newRoster]);
-        setActiveRosterId(newRoster.id);
-        setTab("members");
-        setToast(`Roster "${name}" created`);
-    };
-
-    const renameRoster = () => {
-        const name = (prompt("Rename roster:", activeRoster.name) || "").trim();
-        if (!name || name === activeRoster.name) return;
-        if (rosters.some(r => r.id !== activeRoster.id && r.name.toLowerCase() === name.toLowerCase())) {
-            alert("A roster with that name already exists.");
-            return;
-        }
-        patchActive(r => ({ ...r, name }));
-        setToast("Roster renamed");
-    };
-
-    const deleteRoster = () => {
-        if (rosters.length === 1) {
-            alert("Can't delete the last roster. Create another one first.");
-            return;
-        }
-        if (!confirm(`Delete roster "${activeRoster.name}" and all its sessions? This can't be undone.`)) return;
-        const remaining = rosters.filter(r => r.id !== activeRoster.id);
-        setRosters(remaining);
-        setActiveRosterId(remaining[0].id);
-        setToast("Roster deleted");
-    };
 
     const exportBackup = () => {
         const payload = {
@@ -3121,6 +4028,7 @@ function App() {
             rosters,
             activeRosterId,
             tournaments,
+            rosterTemplates,
         };
         const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
         const url = URL.createObjectURL(blob);
@@ -3170,6 +4078,7 @@ function App() {
                 setRosters(normalized.rosters);
                 setActiveRosterId(normalized.activeRosterId);
                 setTournaments(normalized.tournaments || []);
+                setRosterTemplates(normalized.rosterTemplates || []);
                 setToast("Backup restored");
             };
             reader.readAsText(file);
@@ -3198,6 +4107,12 @@ function App() {
                     <div className="auth-chip">
                         {user ? (
                             <>
+                                {isAdmin && (
+                                    <>
+                                        <button className="btn btn-secondary" onClick={exportBackup} title="Download all data as JSON">Backup</button>
+                                        <button className="btn btn-secondary" onClick={importBackup} title="Restore from a backup file">Restore</button>
+                                    </>
+                                )}
                                 {user.photoURL && <img src={user.photoURL} alt="" className="avatar" referrerPolicy="no-referrer" title={user.email} />}
                                 <button className="btn btn-secondary" onClick={signOut}>Sign out</button>
                             </>
@@ -3214,62 +4129,25 @@ function App() {
                     onClick={() => setSection("live")}
                 >Live</button>
                 <button
-                    className={section === "weekly" ? "active" : ""}
-                    onClick={() => setSection("weekly")}
-                >Weekly / Daily Games</button>
-                <button
                     className={section === "tournament" ? "active" : ""}
                     onClick={() => setSection("tournament")}
                 >Tournament</button>
             </nav>
 
-            {section === "weekly" && (
-                <div className="roster-bar">
-                    <span className="roster-label">Roster</span>
-                    {isAdmin ? (
-                        <>
-                            <select
-                                value={activeRoster.id}
-                                onChange={e => setActiveRosterId(e.target.value)}
-                            >
-                                {rosters.map(r => (
-                                    <option key={r.id} value={r.id}>{r.name}</option>
-                                ))}
-                            </select>
-                            <button className="btn btn-secondary" onClick={createRoster}>+ New</button>
-                            <button className="btn btn-secondary" onClick={renameRoster}>Rename</button>
-                            <button className="btn btn-secondary danger" onClick={deleteRoster}>Delete</button>
-                            <button className="btn btn-secondary" onClick={exportBackup} title="Download all data as JSON">Backup</button>
-                            <button className="btn btn-secondary" onClick={importBackup} title="Restore from a backup file">Restore</button>
-                        </>
-                    ) : isScorer ? (
-                        <span className="roster-name-static">{activeRoster?.name || "—"}</span>
-                    ) : rosters.length > 1 ? (
-                        <select
-                            value={viewingRoster?.id || ""}
-                            onChange={e => setViewingRosterId(e.target.value)}
-                        >
-                            {rosters.map(r => (
-                                <option key={r.id} value={r.id}>{r.name}</option>
-                            ))}
-                        </select>
-                    ) : (
-                        <span className="roster-name-static">{viewingRoster?.name || "—"}</span>
-                    )}
-                </div>
-            )}
-
             {section === "live" ? (
                 <LiveView
                     key={activeRoster?.id + "-live"}
-                    activeRoster={activeRoster}
                     tournaments={tournaments}
+                    setTournaments={isAdmin || isScorer ? setTournaments : null}
                     onViewTournament={navigateToTournament}
+                    showToast={setToast}
                 />
-            ) : section === "tournament" ? (
+            ) : (
                 <TournamentView
                     tournaments={tournaments}
                     setTournaments={isAdmin || isScorer ? setTournaments : () => {}}
+                    rosterTemplates={rosterTemplates}
+                    setRosterTemplates={isAdmin ? setRosterTemplates : null}
                     showToast={setToast}
                     canManage={isAdmin}
                     canScore={isAdmin || isScorer}
@@ -3279,89 +4157,6 @@ function App() {
                     setSelectedTournamentId={setSelectedTournamentId}
                     scorerKey={user?.uid || "anonymous"}
                 />
-            ) : isAdmin ? (
-                <>
-                    <nav>
-                        <button className={tab === "week" ? "active" : ""} onClick={() => setTab("week")}>This Week</button>
-                        <button className={tab === "members" ? "active" : ""} onClick={() => setTab("members")}>Members</button>
-                        <button className={tab === "history" ? "active" : ""} onClick={() => setTab("history")}>History</button>
-                    </nav>
-                    {tab === "week" && (
-                        <ThisWeekView
-                            key={activeRoster.id}
-                            members={activeRoster.members}
-                            currentSession={activeRoster.currentSession}
-                            setCurrentSession={setCurrentSession}
-                            saveSession={saveSession}
-                            showToast={setToast}
-                        />
-                    )}
-                    {tab === "members" && (
-                        <MembersView
-                            key={activeRoster.id}
-                            members={activeRoster.members}
-                            setMembers={setMembers}
-                            resetToPreset={resetToPreset}
-                        />
-                    )}
-                    {tab === "history" && (
-                        <HistoryView
-                            key={activeRoster.id}
-                            sessions={activeRoster.sessions}
-                            members={activeRoster.members}
-                            deleteSession={deleteSession}
-                        />
-                    )}
-                </>
-            ) : isScorer ? (
-                <>
-                    <nav>
-                        <button className={tab === "match" ? "active" : ""} onClick={() => setTab("match")}>Match</button>
-                        <button className={tab === "members" ? "active" : ""} onClick={() => setTab("members")}>Members</button>
-                        <button className={tab === "history" ? "active" : ""} onClick={() => setTab("history")}>History</button>
-                    </nav>
-                    {tab === "match" && (
-                        <MatchView
-                            key={activeRoster?.id}
-                            activeRoster={activeRoster}
-                            patchActive={patchActive}
-                            showToast={setToast}
-                        />
-                    )}
-                    {tab === "members" && (
-                        <PublicMembersView
-                            key={activeRoster?.id}
-                            members={activeRoster?.members || []}
-                        />
-                    )}
-                    {tab === "history" && (
-                        <PublicHistoryView
-                            key={activeRoster?.id}
-                            sessions={activeRoster?.sessions || []}
-                            members={activeRoster?.members || []}
-                        />
-                    )}
-                </>
-            ) : (
-                <>
-                    <nav>
-                        <button className={tab === "members" ? "active" : ""} onClick={() => setTab("members")}>Members</button>
-                        <button className={tab === "history" ? "active" : ""} onClick={() => setTab("history")}>History</button>
-                    </nav>
-                    {tab === "members" && (
-                        <PublicMembersView
-                            key={viewingRoster?.id}
-                            members={viewingRoster?.members || []}
-                        />
-                    )}
-                    {tab === "history" && (
-                        <PublicHistoryView
-                            key={viewingRoster?.id}
-                            sessions={viewingRoster?.sessions || []}
-                            members={viewingRoster?.members || []}
-                        />
-                    )}
-                </>
             )}
 
             {toast && <Toast message={toast} onDone={() => setToast(null)} />}
