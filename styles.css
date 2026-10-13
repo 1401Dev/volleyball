@@ -47,13 +47,73 @@ body {
     background: var(--bg);
     box-shadow: 0 1px 0 var(--border);
 }
+.sticky-top header,
+.sticky-top header::after,
+.sticky-top .logo-mark,
+.sticky-top .logo-mark svg,
+.sticky-top .logo-title,
+.sticky-top nav.section-nav,
+.sticky-top nav.section-nav button,
+.sticky-top .auth-chip,
+.sticky-top .auth-chip .btn,
+.sticky-top .auth-chip .avatar {
+    transition-property: width, height, font-size, padding, margin, gap, border-radius;
+    transition-duration: 0.28s;
+    transition-timing-function: cubic-bezier(0.33, 1, 0.68, 1);
+    will-change: width, height, padding, margin;
+}
+.sticky-top.is-scrolled header {
+    padding: 0.5rem 0 0.5rem;
+    margin-bottom: 0.5rem;
+}
+.sticky-top.is-scrolled header::after {
+    width: 48px;
+    height: 2px;
+}
+.sticky-top.is-scrolled .logo-mark {
+    width: 32px;
+    height: 32px;
+    border-radius: 6px;
+}
+.sticky-top.is-scrolled .logo-mark svg {
+    width: 20px;
+    height: 20px;
+}
+.sticky-top.is-scrolled .logo-title {
+    font-size: 1.1rem;
+}
+.sticky-top.is-scrolled .logo-sub {
+    display: none;
+}
+.sticky-top.is-scrolled nav.section-nav {
+    margin-bottom: 0.5rem;
+}
+.sticky-top.is-scrolled nav.section-nav button {
+    padding: 0.55rem 1.1rem;
+    font-size: 0.78rem;
+}
+.sticky-top.is-scrolled .auth-chip {
+    gap: 0.4rem;
+}
+.sticky-top.is-scrolled .auth-chip .btn {
+    padding: 0.45rem 0.75rem;
+    font-size: 0.7rem;
+    letter-spacing: 0.08em;
+}
+.sticky-top.is-scrolled .auth-chip .avatar {
+    width: 22px;
+    height: 22px;
+}
+.sticky-top.is-scrolled .auth-chip .user-email {
+    display: none;
+}
 header {
     display: flex;
     align-items: center;
     justify-content: space-between;
     padding: 1.25rem 0 1rem;
     border-bottom: 1px solid var(--border);
-    margin-bottom: 1.25rem;
+    margin-bottom: 1rem;
     position: relative;
 }
 header::after {
@@ -129,7 +189,7 @@ header::after {
 nav {
     display: flex;
     gap: 0;
-    margin-bottom: 1.25rem;
+    margin-bottom: 1rem;
     background: var(--surface);
     padding: 0;
     border-radius: 8px;
@@ -484,7 +544,7 @@ button.icon-btn:hover { background: var(--surface-3); color: var(--danger); }
     display: flex;
     align-items: center;
     gap: 0.5rem;
-    margin-bottom: 1.25rem;
+    margin-bottom: 1rem;
     padding: 0.5rem 0.75rem;
     background: var(--surface);
     border: 1px solid var(--border);
@@ -1875,7 +1935,7 @@ nav.section-nav button.active::after { display: none; }
 }
 .tournament-top {
     padding: 0.7rem 0.9rem;
-    margin-bottom: 0.6rem;
+    margin-bottom: 1rem;
 }
 .tournament-hero {
     display: flex;
@@ -1941,9 +2001,14 @@ nav.tournament-tabs button:hover {
 }
 nav.tournament-tabs button.active {
     color: var(--accent);
-    border-bottom-color: var(--accent);
-    background: transparent;
+    border-bottom-color: transparent;
+    background-color: transparent;
+    background-image: linear-gradient(var(--accent), var(--accent));
+    background-size: calc(100% - 1.8rem) 2px;
+    background-position: center bottom;
+    background-repeat: no-repeat;
 }
+nav.tournament-tabs button.active::after { display: none; }
 .live-match-block + .live-match-block,
 .live-match-block { margin-top: 0; }
 .live-match-divider {

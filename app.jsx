@@ -4451,6 +4451,26 @@ function App() {
     const [user, setUser] = useState(null);
     const [authReady, setAuthReady] = useState(false);
     const [cloudReady, setCloudReady] = useState(false);
+    const [scrolled, setScrolled] = useState(false);
+
+    useEffect(() => {
+        let raf = 0;
+        const check = () => {
+            raf = 0;
+            const y = window.scrollY;
+            setScrolled(prev => prev ? y > 4 : y > 16);
+        };
+        const onScroll = () => {
+            if (raf) return;
+            raf = requestAnimationFrame(check);
+        };
+        window.addEventListener("scroll", onScroll, { passive: true });
+        check();
+        return () => {
+            window.removeEventListener("scroll", onScroll);
+            if (raf) cancelAnimationFrame(raf);
+        };
+    }, []);
     // Last payload we know matches Firestore — prevents snapshot↔save loops.
     const lastSyncedRef = useRef(null);
 
@@ -4624,7 +4644,7 @@ function App() {
 
     return (
         <div className="app">
-            <div className="sticky-top">
+            <div className={"sticky-top" + (scrolled ? " is-scrolled" : "")}>
             <header>
                 <div className="logo">
                     <div className="logo-mark">
