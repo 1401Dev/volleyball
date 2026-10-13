@@ -743,12 +743,29 @@ button.icon-btn:hover { background: var(--surface-2); color: var(--danger); }
     padding: 0 0.2rem;
 }
 @media (max-width: 480px) {
-    .scoreboard-2team {
-        grid-template-columns: 1fr;
-    }
+    /* Keep the two-team scoreboard horizontal so viewers see both teams at a
+       glance without scrolling. Tighten paddings and type to fit. */
+    .scoreboard-2team { gap: 0.4rem; }
     .scoreboard-2team .vs-label {
-        min-height: 24px;
+        font-size: 0.9rem;
+        min-width: 24px;
+        letter-spacing: 0.1em;
     }
+    .scoreboard-2team .scoreboard-team {
+        padding: 0.75rem 0.4rem;
+        gap: 0.4rem;
+    }
+    .scoreboard-2team .scoreboard-team .score-value { font-size: 2.1rem; }
+    .scoreboard-2team .scoreboard-team .jersey {
+        width: 32px;
+        height: 32px;
+        font-size: 1.1rem;
+    }
+    .scoreboard-2team .t-live-team-name {
+        font-size: 0.82rem;
+        letter-spacing: 0.04em;
+    }
+    .scoreboard-2team .live-timeouts-label { font-size: 0.6rem; }
 }
 .scoreboard-team {
     display: flex;
@@ -1571,14 +1588,21 @@ nav.section-nav button.active::after { display: none; }
     margin: 0.25rem 0 0.75rem;
     flex-wrap: wrap;
 }
+/* Pin every timer box to a fixed height so a single clock, a clock+timeout
+   pair, and even a shrunk mobile pair all occupy the same row height. Without
+   this, swiping between two live courts in the carousel makes the scoreboard
+   below the row shift up or down. */
 .live-timer {
     display: inline-flex;
     align-items: center;
+    justify-content: center;
     gap: 0.75rem;
-    padding: 0.55rem 1.1rem;
+    padding: 0 1.1rem;
     background: var(--surface-2);
     border: 1px solid var(--border);
     border-radius: 10px;
+    box-sizing: border-box;
+    height: 3.6rem;
 }
 .live-timer-main.running {
     border-color: var(--accent);
@@ -1613,7 +1637,16 @@ nav.section-nav button.active::after { display: none; }
 }
 .live-timer-row.expired .live-timer-main .live-timer-value { color: var(--danger); }
 /* When a timeout is active, de-emphasise the paused match timer so the
-   timeout count takes the eye. */
+   timeout count takes the eye — and keep both timers on the same row so
+   viewers see them side-by-side instead of stacked. */
+.live-timer-row.with-timeout {
+    flex-wrap: nowrap;
+    gap: 0.5rem;
+}
+.live-timer-row.with-timeout .live-timer {
+    min-width: 0;
+    flex: 0 1 auto;
+}
 .live-timer-row.with-timeout .live-timer-main {
     opacity: 0.75;
 }
@@ -1626,7 +1659,19 @@ nav.section-nav button.active::after { display: none; }
 }
 @media (max-width: 480px) {
     .live-timer-value { font-size: 2rem; }
-    .live-timer { padding: 0.6rem 1rem; }
+    .live-timer { padding: 0 1rem; height: 3.3rem; }
+    /* When a timeout is running on a phone, both timers must share one row,
+       so shrink each one enough to fit without wrapping — but keep the box
+       height fixed so the row doesn't change size between slides. */
+    .live-timer-row.with-timeout .live-timer {
+        padding: 0 0.6rem;
+        gap: 0.4rem;
+    }
+    .live-timer-row.with-timeout .live-timer-value { font-size: 1.5rem; }
+    .live-timer-row.with-timeout .live-timer-label {
+        font-size: 0.6rem;
+        letter-spacing: 0.1em;
+    }
 }
 /* Emergency variant used for "end timeout without resuming" — rare, so it
    reads as a warning instead of a normal secondary button. */
@@ -2190,4 +2235,182 @@ nav.tournament-tabs button.active {
 .live-controls {
     margin-top: 0.5rem;
     flex-wrap: wrap;
+}
+/* Apple-Sports-style swipe pager for a tournament with 2+ courts live at once.
+   The row scroll-snaps horizontally so a touch swipe always lands on exactly
+   one match; dots and arrows below drive it on desktop. */
+.live-carousel {
+    display: flex;
+    overflow-x: auto;
+    scroll-snap-type: x mandatory;
+    scroll-behavior: smooth;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+}
+.live-carousel::-webkit-scrollbar { display: none; }
+.live-slide {
+    flex: 0 0 100%;
+    min-width: 0;
+    scroll-snap-align: start;
+    scroll-snap-stop: always;
+    box-sizing: border-box;
+}
+.live-pager {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.75rem;
+    margin-top: 0.9rem;
+}
+.live-pager-arrow {
+    width: 2rem;
+    height: 2rem;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    background: var(--surface-2);
+    color: var(--text);
+    font-size: 1.3rem;
+    line-height: 1;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    padding: 0;
+    transition: background 0.15s, border-color 0.15s, color 0.15s;
+}
+.live-pager-arrow:hover:not(:disabled) {
+    background: rgba(57, 255, 20, 0.08);
+    border-color: var(--accent);
+    color: var(--accent);
+}
+.live-pager-arrow:disabled {
+    opacity: 0.35;
+    cursor: default;
+}
+.live-pager-dots {
+    display: inline-flex;
+    gap: 0.4rem;
+    align-items: center;
+}
+.live-pager-dot {
+    width: 0.5rem;
+    height: 0.5rem;
+    border-radius: 999px;
+    background: var(--border-strong, var(--border));
+    border: none;
+    padding: 0;
+    cursor: pointer;
+    transition: background 0.15s, transform 0.15s;
+}
+.live-pager-dot:hover { background: var(--text-dim); }
+.live-pager-dot.active {
+    background: var(--accent);
+    transform: scale(1.3);
+}
+.live-pager-label {
+    text-align: center;
+    margin-top: 0.4rem;
+    font-size: 0.72rem;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--text-dim);
+    font-family: var(--display);
+    font-weight: 600;
+}
+@media (max-width: 480px) {
+    .live-pager-arrow { display: none; }
+}
+
+/* ------------------------------------------------------------------ */
+/* Compact scoring on mobile. Scorers tap +/- rapidly during a match, */
+/* so the whole Record Match card needs to fit on one phone viewport  */
+/* without scrolling between the clock, the score, and End Match.     */
+/* ------------------------------------------------------------------ */
+@media (max-width: 600px) {
+    /* Lose the tournament hero/stats/help while actively scoring —
+       the scorer already knows which tournament they're in and the
+       stats belong on the Standings/Matches tabs. */
+    .tournament-view.score-mode .tournament-top { display: none; }
+
+    /* The card is obviously the scoreboard; drop its heading. */
+    .tournament-view.score-mode > .card > h2:first-child { display: none; }
+
+    /* Trim the sticky header + nav so less of the viewport is chrome. */
+    .sticky-top header {
+        padding: 0.55rem 0 0.5rem;
+        margin-bottom: 0.6rem;
+    }
+    .sticky-top header::after { width: 48px; height: 2px; }
+    .logo-mark { width: 32px; height: 32px; border-radius: 8px; }
+    .logo-mark svg { width: 20px; height: 20px; }
+    .logo-title { font-size: 1.1rem; }
+    .logo-sub { display: none; }
+    nav.section-nav { margin-bottom: 0.6rem; }
+    nav.section-nav button { padding: 0.6rem 0.9rem; }
+
+    /* Pull the match clock into a single tight strip. */
+    .tournament-view.score-mode .scoreboard-timer,
+    .live-match-block .scoreboard-timer {
+        padding: 0.5rem 0.75rem;
+        gap: 0.5rem;
+        margin-bottom: 0.6rem;
+    }
+    .tournament-view.score-mode .scoreboard-timer .timer-display,
+    .live-match-block .scoreboard-timer .timer-display { font-size: 1.75rem; }
+    .tournament-view.score-mode .timer-controls .btn {
+        padding: 0.4rem 0.7rem;
+        font-size: 0.78rem;
+    }
+    .tournament-view.score-mode .duration-static { display: none; }
+
+    /* Compact the two team tiles but keep the +/- buttons tall enough
+       for a thumb (≥44px) — those are the hot path during live play. */
+    .tournament-view.score-mode .scoreboard-2team .scoreboard-team {
+        padding: 0.5rem 0.35rem;
+        gap: 0.3rem;
+    }
+    .tournament-view.score-mode .scoreboard-2team .scoreboard-team .score-value {
+        font-size: 2.4rem;
+    }
+    .tournament-view.score-mode .scoreboard-team-picker {
+        padding: 0.3rem 0.3rem;
+        font-size: 0.7rem;
+    }
+    .tournament-view.score-mode .scoreboard-team .score-controls { gap: 0.3rem; }
+    .tournament-view.score-mode .scoreboard-team .score-controls .btn {
+        padding: 0.75rem 0.3rem;
+        font-size: 1.25rem;
+        min-height: 44px;
+    }
+    .tournament-view.score-mode .timeout-row {
+        margin-top: 0.15rem;
+        gap: 0.3rem;
+    }
+    .tournament-view.score-mode .timeout-dot { width: 7px; height: 7px; }
+    .tournament-view.score-mode .timeout-dots { gap: 0.2rem; }
+    .tournament-view.score-mode .timeout-btn {
+        padding: 0.3rem 0.4rem !important;
+        font-size: 0.62rem !important;
+    }
+    .tournament-view.score-mode .scoreboard-teams { margin-bottom: 0.6rem; }
+
+    /* Thinner card padding on the score tab. */
+    .tournament-view.score-mode > .card { padding: 0.65rem 0.7rem; }
+
+    /* Timeout banner shouldn't dominate the view. */
+    .tournament-view.score-mode .timeout-banner {
+        padding: 0.5rem 0.65rem;
+        gap: 0.4rem;
+    }
+    .tournament-view.score-mode .timeout-banner-head { font-size: 0.78rem; }
+
+    /* Keep End Match / Reset tappable without stretching the row. */
+    .tournament-view.score-mode .btn-row {
+        gap: 0.4rem;
+        margin-top: 0.2rem;
+    }
+    .tournament-view.score-mode .btn-row .btn {
+        padding: 0.6rem 0.6rem;
+        font-size: 0.78rem;
+    }
 }

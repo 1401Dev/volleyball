@@ -3445,7 +3445,7 @@ function TournamentView({ tournaments, setTournaments, rosterTemplates, setRoste
     const currentTab = validKeys.includes(tournamentTab) ? tournamentTab : "standings";
 
     return (
-        <div>
+        <div className={`tournament-view${currentTab === "score" ? " score-mode" : ""}`}>
             {canManage && picking && (
                 <KindChooserCard
                     onCreate={createTournament}
@@ -3967,7 +3967,17 @@ function TournamentLiveCard({ tournament, slots, onViewTournament, onDismissSlot
     const recentMatches = allMatches.slice(-3).reverse();
     const multi = slots.length > 1;
     const [expanded, setExpanded] = useState(false);
+    const [activeIdx, setActiveIdx] = useState(0);
+    const carouselRef = useRef(null);
     const matchDurationMin = tournament.matchDurationMin || DEFAULT_MATCH_MIN;
+
+    // Keep activeIdx in range if the number of live slots shrinks (e.g. a match
+    // ends while the card is open).
+    useEffect(() => {
+        if (activeIdx > slots.length - 1) {
+            setActiveIdx(Math.max(0, slots.length - 1));
+        }
+    }, [slots.length, activeIdx]);
 
     // Pause/Resume toggle for a specific live slot. Captures the current
     // elapsedMs into timerAccumMs when pausing so the clock doesn't jump.
@@ -3981,6 +3991,69 @@ function TournamentLiveCard({ tournament, slots, onViewTournament, onDismissSlot
         } else {
             onPatchSlot(slotKey, { timerRunning: true, timerStartAt: Date.now() });
         }
+    };
+
+    const scrollToSlide = (idx) => {
+        const el = carouselRef.current;
+        if (!el) return;
+        el.scrollTo({ left: idx * el.clientWidth, behavior: "smooth" });
+        setActiveIdx(idx);
+    };
+
+    const onCarouselScroll = () => {
+        const el = carouselRef.current;
+        if (!el) return;
+        const idx = Math.round(el.scrollLeft / Math.max(1, el.clientWidth));
+        if (idx !== activeIdx) setActiveIdx(idx);
+    };
+
+    // Render one match's scoreboard + its scorer controls. Reused by both the
+    // single-match layout and the multi-match swipe carousel so the controls
+    // stay in sync.
+    const renderSlot = ({ match: am, slotKey }) => {
+        const running = !!am.timerRunning;
+        const elapsed = (Number(am.timerAccumMs) || 0) > 0 || running;
+        return (
+            <>
+                <TournamentLiveMatch tournament={tournament} match={am} />
+                {(onPatchSlot || onDismissSlot) && (
+                    <div className="btn-row live-controls">
+                        {onPatchSlot && (
+                            <button
+                                className="btn"
+                                onClick={() => toggleSlotTimer(slotKey, am)}
+                                disabled={!!am.timeoutTeam}
+                                title={am.timeoutTeam ? "Match timer is paused during a timeout" : ""}
+                            >
+                                {running ? "⏸ Pause" : (elapsed ? "▶ Resume" : "▶ Start")}
+                            </button>
+                        )}
+                        {onPatchSlot && (
+                            <button
+                                className="btn btn-secondary"
+                                onClick={() => {
+                                    if (!confirm("Reset the match timer to " + matchDurationMin + " min? Any active timeout will be cleared.")) return;
+                                    onPatchSlot(slotKey, {
+                                        timerRunning: false,
+                                        timerStartAt: null,
+                                        timerAccumMs: 0,
+                                        timeoutTeam: null,
+                                        timeoutStartAt: null,
+                                    });
+                                }}
+                            >Reset timer</button>
+                        )}
+                        {onDismissSlot && (
+                            <button
+                                className="btn btn-secondary"
+                                onClick={() => onDismissSlot(slotKey)}
+                                title="Clear this live match without recording it"
+                            >Clear live match</button>
+                        )}
+                    </div>
+                )}
+            </>
+        );
     };
 
     return (
@@ -4012,54 +4085,73 @@ function TournamentLiveCard({ tournament, slots, onViewTournament, onDismissSlot
                 </div>
             )}
 
+            {expanded && !multi && (
+                <>
+                    {slots.map((slot) => (
+                        <React.Fragment key={slot.slotKey}>
+                            {renderSlot(slot)}
+                        </React.Fragment>
+                    ))}
+                </>
+            )}
+
+            {expanded && multi && (
+                <>
+                    <div
+                        className="live-carousel"
+                        ref={carouselRef}
+                        onScroll={onCarouselScroll}
+                        role="group"
+                        aria-roledescription="carousel"
+                        aria-label={`${slots.length} live matches — swipe to switch`}
+                    >
+                        {slots.map((slot, i) => (
+                            <div
+                                key={slot.slotKey}
+                                className="live-slide"
+                                role="group"
+                                aria-roledescription="slide"
+                                aria-label={`Match ${i + 1} of ${slots.length}`}
+                            >
+                                {renderSlot(slot)}
+                            </div>
+                        ))}
+                    </div>
+                    <div className="live-pager">
+                        <button
+                            type="button"
+                            className="live-pager-arrow"
+                            onClick={() => scrollToSlide(Math.max(0, activeIdx - 1))}
+                            disabled={activeIdx === 0}
+                            aria-label="Previous match"
+                        >‹</button>
+                        <div className="live-pager-dots" role="tablist">
+                            {slots.map((_, i) => (
+                                <button
+                                    key={i}
+                                    type="button"
+                                    className={`live-pager-dot${i === activeIdx ? " active" : ""}`}
+                                    onClick={() => scrollToSlide(i)}
+                                    role="tab"
+                                    aria-selected={i === activeIdx}
+                                    aria-label={`Match ${i + 1}`}
+                                />
+                            ))}
+                        </div>
+                        <button
+                            type="button"
+                            className="live-pager-arrow"
+                            onClick={() => scrollToSlide(Math.min(slots.length - 1, activeIdx + 1))}
+                            disabled={activeIdx === slots.length - 1}
+                            aria-label="Next match"
+                        >›</button>
+                    </div>
+                    <div className="live-pager-label">Match {activeIdx + 1} of {slots.length}</div>
+                </>
+            )}
+
             {expanded && (
                 <>
-                    {slots.map(({ match: am, slotKey }, i) => {
-                        const running = !!am.timerRunning;
-                        const elapsed = (Number(am.timerAccumMs) || 0) > 0 || running;
-                        return (
-                            <React.Fragment key={slotKey}>
-                                {i > 0 && <div className="live-match-divider" />}
-                                <TournamentLiveMatch tournament={tournament} match={am} />
-                                {(onPatchSlot || onDismissSlot) && (
-                                    <div className="btn-row live-controls">
-                                        {onPatchSlot && (
-                                            <button
-                                                className="btn"
-                                                onClick={() => toggleSlotTimer(slotKey, am)}
-                                                disabled={!!am.timeoutTeam}
-                                                title={am.timeoutTeam ? "Match timer is paused during a timeout" : ""}
-                                            >
-                                                {running ? "⏸ Pause" : (elapsed ? "▶ Resume" : "▶ Start")}
-                                            </button>
-                                        )}
-                                        {onPatchSlot && (
-                                            <button
-                                                className="btn btn-secondary"
-                                                onClick={() => {
-                                                    if (!confirm("Reset the match timer to " + matchDurationMin + " min? Any active timeout will be cleared.")) return;
-                                                    onPatchSlot(slotKey, {
-                                                        timerRunning: false,
-                                                        timerStartAt: null,
-                                                        timerAccumMs: 0,
-                                                        timeoutTeam: null,
-                                                        timeoutStartAt: null,
-                                                    });
-                                                }}
-                                            >Reset timer</button>
-                                        )}
-                                        {onDismissSlot && (
-                                            <button
-                                                className="btn btn-secondary"
-                                                onClick={() => onDismissSlot(slotKey)}
-                                                title="Clear this live match without recording it"
-                                            >Clear live match</button>
-                                        )}
-                                    </div>
-                                )}
-                            </React.Fragment>
-                        );
-                    })}
                     {recentMatches.length > 0 && (
                         <>
                             <h3 className="live-section-title">Last {recentMatches.length} match{recentMatches.length === 1 ? "" : "es"}</h3>
