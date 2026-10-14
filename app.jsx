@@ -195,6 +195,24 @@ const nextFriday = () => {
 
 const todayISO = () => new Date().toISOString().slice(0, 10);
 
+// ---- Weekly poll ---------------------------------------------------------
+// Every signed-in Google user can cast one In/Out vote per weekly session.
+// Votes live at polls/{weekId}/votes/{uid}; the uid in the path lets Firestore
+// rules enforce "one vote per user" without any admin involvement.
+//
+// Minimum Firestore rules to drop into the console:
+//   match /polls/{pollId} {
+//     allow read: if true;
+//     allow write: if request.auth.uid == "GiQwaYz7zGeG2bipauadUFO36NI3";
+//     match /votes/{uid} {
+//       allow read: if true;
+//       allow write: if request.auth != null && request.auth.uid == uid;
+//     }
+//   }
+const pollIdForDate = (iso) => `week-${iso}`;
+// Flip to true to show the Poll tab to everyone.
+const POLL_ENABLED = false;
+
 const DEFAULT_MATCH_MIN = 11;
 const DEFAULT_TIMEOUT_MIN = 1;
 const TIMEOUTS_PER_TEAM = 2;
@@ -2185,7 +2203,7 @@ function RosterTeamsCard({ tournament, patchTournament, disabled }) {
             <div className="card">
                 <h2>Teams</h2>
                 <div className="empty">
-                    Admin is finalizing the teams. They'll appear here once published.
+                    Teams are not generated yet. They'll appear here once generated.
                 </div>
             </div>
         );
@@ -4677,6 +4695,231 @@ function TournamentLiveCard({ tournament, slots, onViewTournament, onDismissSlot
     );
 }
 
+function PollView({ user, isAdmin, onSignIn, showToast }) {
+    const [date, setDate] = useState(() => nextFriday());
+    const [votes, setVotes] = useState({});
+    const [loading, setLoading] = useState(true);
+    const [error, setError] = useState(null);
+    const [busy, setBusy] = useState(false);
+
+    const pollId = pollIdForDate(date);
+    const pollDocRef = useMemo(() => db.collection("polls").doc(pollId), [pollId]);
+
+    useEffect(() => {
+        setLoading(true);
+        setError(null);
+        const unsub = pollDocRef.collection("votes").onSnapshot(
+            snap => {
+                const next = {};
+                snap.forEach(doc => { next[doc.id] = doc.data(); });
+                setVotes(next);
+                setLoading(false);
+            },
+            err => {
+                console.error("[poll] snapshot error:", err);
+                setError(err?.message || String(err));
+                setLoading(false);
+            }
+        );
+        return unsub;
+    }, [pollDocRef]);
+
+    const myVote = user ? votes[user.uid]?.status || null : null;
+
+    const castVote = async (status) => {
+        if (!user) return;
+        if (busy) return;
+        setBusy(true);
+        const voteRef = pollDocRef.collection("votes").doc(user.uid);
+        try {
+            if (myVote === status) {
+                await voteRef.delete();
+                showToast?.("Vote cleared");
+            } else {
+                await voteRef.set({
+                    status,
+                    name: user.displayName || user.email || "Player",
+                    photoURL: user.photoURL || null,
+                    at: firebase.firestore.FieldValue.serverTimestamp(),
+                });
+                showToast?.(status === "in" ? "You're in!" : "Marked out");
+            }
+        } catch (err) {
+            console.error("[poll] vote failed:", err);
+            showToast?.("Vote failed: " + (err?.message || err));
+        } finally {
+            setBusy(false);
+        }
+    };
+
+    const clearAll = async () => {
+        if (!isAdmin) return;
+        if (!confirm(`Clear ALL votes for ${formatDate(date)}? This can't be undone.`)) return;
+        try {
+            const snap = await pollDocRef.collection("votes").get();
+            const batch = db.batch();
+            snap.forEach(d => batch.delete(d.ref));
+            await batch.commit();
+            showToast?.("Poll reset");
+        } catch (err) {
+            console.error("[poll] clear failed:", err);
+            showToast?.("Clear failed: " + (err?.message || err));
+        }
+    };
+
+    const voteList = Object.entries(votes).map(([uid, v]) => ({ uid, ...v }));
+    const inVotes = voteList
+        .filter(v => v.status === "in")
+        .sort((a, b) => (a.at?.seconds || 0) - (b.at?.seconds || 0));
+    const outVotes = voteList
+        .filter(v => v.status === "out")
+        .sort((a, b) => (a.at?.seconds || 0) - (b.at?.seconds || 0));
+    const total = inVotes.length + outVotes.length;
+    const inPct = total === 0 ? 0 : Math.round((inVotes.length / total) * 100);
+
+    return (
+        <div className="poll-view">
+            <div className="card poll-hero">
+                <div className="poll-hero-eyebrow">This week's game</div>
+                <div className="poll-hero-row">
+                    <h1 className="poll-hero-title">{formatDate(date)}</h1>
+                    {isAdmin && (
+                        <input
+                            type="date"
+                            value={date}
+                            onChange={e => setDate(e.target.value || nextFriday())}
+                            className="poll-date-picker"
+                            title="Change poll date"
+                        />
+                    )}
+                </div>
+                <p className="poll-hero-sub">
+                    Playing this week? Tap your answer below — everyone sees it live.
+                </p>
+                {total > 0 && (
+                    <div className="poll-bar" aria-hidden="true">
+                        <div className="poll-bar-in" style={{ width: `${inPct}%` }}></div>
+                        <div className="poll-bar-out" style={{ width: `${100 - inPct}%` }}></div>
+                    </div>
+                )}
+                <div className="poll-hero-stats">
+                    <div className="poll-hero-stat in">
+                        <span className="num">{inVotes.length}</span>
+                        <span className="label">In</span>
+                    </div>
+                    <div className="poll-hero-stat out">
+                        <span className="num">{outVotes.length}</span>
+                        <span className="label">Out</span>
+                    </div>
+                    <div className="poll-hero-stat">
+                        <span className="num">{total}</span>
+                        <span className="label">Voted</span>
+                    </div>
+                </div>
+            </div>
+
+            <div className="card poll-cta-card">
+                {!user ? (
+                    <div className="poll-signin">
+                        <p className="poll-signin-text">Sign in with Google to cast your vote.</p>
+                        <button className="btn" onClick={onSignIn}>Sign in</button>
+                    </div>
+                ) : (
+                    <>
+                        <div className="poll-cta-grid">
+                            <button
+                                type="button"
+                                className={`poll-cta poll-in${myVote === "in" ? " active" : ""}`}
+                                onClick={() => castVote("in")}
+                                disabled={busy}
+                            >
+                                <span className="poll-cta-icon" aria-hidden="true">✓</span>
+                                <span className="poll-cta-label">I'm In</span>
+                                <span className="poll-cta-count">{inVotes.length}</span>
+                            </button>
+                            <button
+                                type="button"
+                                className={`poll-cta poll-out${myVote === "out" ? " active" : ""}`}
+                                onClick={() => castVote("out")}
+                                disabled={busy}
+                            >
+                                <span className="poll-cta-icon" aria-hidden="true">✕</span>
+                                <span className="poll-cta-label">I'm Out</span>
+                                <span className="poll-cta-count">{outVotes.length}</span>
+                            </button>
+                        </div>
+                        {myVote && (
+                            <div className="poll-cta-hint">
+                                You voted <strong>{myVote === "in" ? "In" : "Out"}</strong>. Tap the same button again to clear your vote.
+                            </div>
+                        )}
+                    </>
+                )}
+            </div>
+
+            {error && (
+                <div className="card poll-error">
+                    <strong>Couldn't load the poll:</strong> {error}
+                </div>
+            )}
+
+            <div className="poll-lists-grid">
+                <div className="card poll-list-card poll-list-in">
+                    <div className="poll-list-head">
+                        <h3>In <span className="poll-list-count">{inVotes.length}</span></h3>
+                    </div>
+                    {loading ? (
+                        <div className="empty">Loading…</div>
+                    ) : inVotes.length === 0 ? (
+                        <div className="empty">No one yet.</div>
+                    ) : (
+                        <div className="poll-voter-list">
+                            {inVotes.map(v => (
+                                <div key={v.uid} className="poll-voter">
+                                    {v.photoURL
+                                        ? <img src={v.photoURL} alt="" referrerPolicy="no-referrer" />
+                                        : <span className="poll-voter-initial">{(v.name || "?").slice(0, 1).toUpperCase()}</span>}
+                                    <span className="poll-voter-name">{v.name}</span>
+                                </div>
+                            ))}
+                        </div>
+                    )}
+                </div>
+                <div className="card poll-list-card poll-list-out">
+                    <div className="poll-list-head">
+                        <h3>Out <span className="poll-list-count">{outVotes.length}</span></h3>
+                    </div>
+                    {loading ? (
+                        <div className="empty">Loading…</div>
+                    ) : outVotes.length === 0 ? (
+                        <div className="empty">No one yet.</div>
+                    ) : (
+                        <div className="poll-voter-list">
+                            {outVotes.map(v => (
+                                <div key={v.uid} className="poll-voter">
+                                    {v.photoURL
+                                        ? <img src={v.photoURL} alt="" referrerPolicy="no-referrer" />
+                                        : <span className="poll-voter-initial">{(v.name || "?").slice(0, 1).toUpperCase()}</span>}
+                                    <span className="poll-voter-name">{v.name}</span>
+                                </div>
+                            ))}
+                        </div>
+                    )}
+                </div>
+            </div>
+
+            {isAdmin && total > 0 && (
+                <div className="card">
+                    <div className="btn-row">
+                        <button className="btn btn-danger" onClick={clearAll}>Reset poll</button>
+                    </div>
+                    <p className="help-text">Admin only — clears every vote for the selected date.</p>
+                </div>
+            )}
+        </div>
+    );
+}
+
 function App() {
     const stored = loadState();
     const initial = stored || {
@@ -4952,6 +5195,12 @@ function App() {
                     className={section === "live" ? "active" : ""}
                     onClick={() => setSection("live")}
                 >Live</button>
+                {POLL_ENABLED && (
+                    <button
+                        className={section === "poll" ? "active" : ""}
+                        onClick={() => setSection("poll")}
+                    >Poll</button>
+                )}
                 <button
                     className={section === "tournament" ? "active" : ""}
                     onClick={() => setSection("tournament")}
@@ -4972,6 +5221,13 @@ function App() {
                     tournaments={tournaments}
                     setTournaments={isAdmin || isScorer ? setTournaments : null}
                     onViewTournament={navigateToTournament}
+                    showToast={setToast}
+                />
+            ) : section === "poll" && POLL_ENABLED ? (
+                <PollView
+                    user={user}
+                    isAdmin={isAdmin}
+                    onSignIn={signIn}
                     showToast={setToast}
                 />
             ) : (
