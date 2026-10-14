@@ -388,6 +388,104 @@ function Toast({ message, onDone }) {
     return <div className="toast">{message}</div>;
 }
 
+function TournamentSearchOverlay({ tournaments, onClose, onPick }) {
+    const [query, setQuery] = useState("");
+    const [activeIdx, setActiveIdx] = useState(0);
+    const inputRef = useRef(null);
+
+    useEffect(() => {
+        inputRef.current?.focus();
+        const onKey = (e) => { if (e.key === "Escape") onClose(); };
+        window.addEventListener("keydown", onKey);
+        const prevOverflow = document.body.style.overflow;
+        document.body.style.overflow = "hidden";
+        return () => {
+            window.removeEventListener("keydown", onKey);
+            document.body.style.overflow = prevOverflow;
+        };
+    }, []);
+
+    const q = query.trim().toLowerCase();
+    const results = (tournaments || [])
+        .map(t => ({ t, score: q ? (t.name || "").toLowerCase().indexOf(q) : 0 }))
+        .filter(r => !q || r.score >= 0)
+        .sort((a, b) => {
+            if (!q) {
+                // No query: most recent first (by date, then by position in list reversed).
+                const ad = a.t.date || "";
+                const bd = b.t.date || "";
+                if (ad !== bd) return bd.localeCompare(ad);
+                return 0;
+            }
+            if (a.score !== b.score) return a.score - b.score;
+            return (a.t.name || "").localeCompare(b.t.name || "");
+        })
+        .map(r => r.t);
+
+    useEffect(() => { setActiveIdx(0); }, [query]);
+
+    const onKeyDown = (e) => {
+        if (e.key === "ArrowDown") {
+            e.preventDefault();
+            setActiveIdx(i => Math.min(results.length - 1, i + 1));
+        } else if (e.key === "ArrowUp") {
+            e.preventDefault();
+            setActiveIdx(i => Math.max(0, i - 1));
+        } else if (e.key === "Enter") {
+            e.preventDefault();
+            const pick = results[activeIdx];
+            if (pick) onPick(pick.id);
+        }
+    };
+
+    return (
+        <div className="search-overlay" onMouseDown={onClose}>
+            <div className="search-panel" onMouseDown={e => e.stopPropagation()}>
+                <div className="search-input-row">
+                    <svg className="search-input-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                        <circle cx="11" cy="11" r="7" />
+                        <path d="M20 20l-3.5-3.5" />
+                    </svg>
+                    <input
+                        ref={inputRef}
+                        type="text"
+                        value={query}
+                        onChange={e => setQuery(e.target.value)}
+                        onKeyDown={onKeyDown}
+                        placeholder="Search tournaments..."
+                        className="search-input"
+                        autoComplete="off"
+                    />
+                    <button className="search-close" onClick={onClose} aria-label="Close search">×</button>
+                </div>
+                <div className="search-results">
+                    {results.length === 0 ? (
+                        <div className="search-empty">
+                            {q ? `No tournaments match "${query}".` : "No tournaments yet."}
+                        </div>
+                    ) : (
+                        results.map((t, i) => (
+                            <button
+                                key={t.id}
+                                type="button"
+                                className={`search-result${i === activeIdx ? " active" : ""}`}
+                                onMouseEnter={() => setActiveIdx(i)}
+                                onClick={() => onPick(t.id)}
+                            >
+                                <span className="search-result-name">{t.name}</span>
+                                <span className="search-result-meta">
+                                    {t.date ? formatDate(t.date) : ""}
+                                    {t.endedAt ? <span className="search-result-badge">Ended</span> : null}
+                                </span>
+                            </button>
+                        ))
+                    )}
+                </div>
+            </div>
+        </div>
+    );
+}
+
 function CatBadge({ category, rank }) {
     return (
         <span className={`cat-badge c${category}`}>
@@ -4452,6 +4550,7 @@ function App() {
     const [authReady, setAuthReady] = useState(false);
     const [cloudReady, setCloudReady] = useState(false);
     const [scrolled, setScrolled] = useState(false);
+    const [searchOpen, setSearchOpen] = useState(false);
 
     useEffect(() => {
         let raf = 0;
@@ -4659,24 +4758,37 @@ function App() {
                         <span className="logo-title">Volleyball Club</span>
                     </div>
                 </div>
-                {authReady && (
-                    <div className="auth-chip">
-                        {user ? (
-                            <>
-                                {isAdmin && (
-                                    <>
-                                        <button className="btn btn-secondary" onClick={exportBackup} title="Download all data as JSON">Backup</button>
-                                        <button className="btn btn-secondary" onClick={importBackup} title="Restore from a backup file">Restore</button>
-                                    </>
-                                )}
-                                {user.photoURL && <img src={user.photoURL} alt="" className="avatar" referrerPolicy="no-referrer" title={user.email} />}
-                                <button className="btn btn-secondary" onClick={signOut}>Sign out</button>
-                            </>
-                        ) : (
-                            <button className="btn" onClick={signIn}>Sign in</button>
-                        )}
-                    </div>
-                )}
+                <div className="header-actions">
+                    <button
+                        className="icon-btn search-btn"
+                        onClick={() => setSearchOpen(true)}
+                        title="Search tournaments"
+                        aria-label="Search tournaments"
+                    >
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                            <circle cx="11" cy="11" r="7" />
+                            <path d="M20 20l-3.5-3.5" />
+                        </svg>
+                    </button>
+                    {authReady && (
+                        <div className="auth-chip">
+                            {user ? (
+                                <>
+                                    {isAdmin && (
+                                        <>
+                                            <button className="btn btn-secondary" onClick={exportBackup} title="Download all data as JSON">Backup</button>
+                                            <button className="btn btn-secondary" onClick={importBackup} title="Restore from a backup file">Restore</button>
+                                        </>
+                                    )}
+                                    {user.photoURL && <img src={user.photoURL} alt="" className="avatar" referrerPolicy="no-referrer" title={user.email} />}
+                                    <button className="btn btn-secondary" onClick={signOut}>Sign out</button>
+                                </>
+                            ) : (
+                                <button className="btn" onClick={signIn}>Sign in</button>
+                            )}
+                        </div>
+                    )}
+                </div>
             </header>
 
             <nav className="section-nav">
@@ -4717,6 +4829,13 @@ function App() {
             )}
 
             {toast && <Toast message={toast} onDone={() => setToast(null)} />}
+            {searchOpen && (
+                <TournamentSearchOverlay
+                    tournaments={tournaments}
+                    onClose={() => setSearchOpen(false)}
+                    onPick={(id) => { setSearchOpen(false); navigateToTournament(id); }}
+                />
+            )}
         </div>
     );
 }
