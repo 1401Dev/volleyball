@@ -4946,6 +4946,7 @@ function App() {
     const [cloudReady, setCloudReady] = useState(false);
     const [scrolled, setScrolled] = useState(false);
     const [searchOpen, setSearchOpen] = useState(false);
+    const scrollSentinelRef = useRef(null);
     const [theme, setTheme] = useState(() => {
         try {
             const saved = localStorage.getItem("theme");
@@ -4963,22 +4964,14 @@ function App() {
     }, [theme]);
 
     useEffect(() => {
-        let raf = 0;
-        const check = () => {
-            raf = 0;
-            const y = window.scrollY;
-            setScrolled(prev => prev ? y > 4 : y > 16);
-        };
-        const onScroll = () => {
-            if (raf) return;
-            raf = requestAnimationFrame(check);
-        };
-        window.addEventListener("scroll", onScroll, { passive: true });
-        check();
-        return () => {
-            window.removeEventListener("scroll", onScroll);
-            if (raf) cancelAnimationFrame(raf);
-        };
+        const el = scrollSentinelRef.current;
+        if (!el || typeof IntersectionObserver !== "function") return;
+        const io = new IntersectionObserver(
+            ([entry]) => setScrolled(!entry.isIntersecting),
+            { threshold: 0 }
+        );
+        io.observe(el);
+        return () => io.disconnect();
     }, []);
     // Last payload we know matches Firestore — prevents snapshot↔save loops.
     const lastSyncedRef = useRef(null);
@@ -5153,6 +5146,7 @@ function App() {
 
     return (
         <div className="app">
+            <div ref={scrollSentinelRef} aria-hidden="true" style={{ height: 1, marginBottom: -1 }} />
             <div className={"sticky-top" + (scrolled ? " is-scrolled" : "")}>
             <header>
                 <div className="logo">
