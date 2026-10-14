@@ -4946,6 +4946,21 @@ function App() {
     const [cloudReady, setCloudReady] = useState(false);
     const [scrolled, setScrolled] = useState(false);
     const [searchOpen, setSearchOpen] = useState(false);
+    const [theme, setTheme] = useState(() => {
+        try {
+            const saved = localStorage.getItem("theme");
+            if (saved === "light" || saved === "dark") return saved;
+        } catch {}
+        try {
+            if (window.matchMedia?.("(prefers-color-scheme: dark)").matches) return "dark";
+        } catch {}
+        return "light";
+    });
+
+    useEffect(() => {
+        document.documentElement.setAttribute("data-theme", theme);
+        try { localStorage.setItem("theme", theme); } catch {}
+    }, [theme]);
 
     useEffect(() => {
         let raf = 0;
@@ -5154,6 +5169,23 @@ function App() {
                     </div>
                 </div>
                 <div className="header-actions">
+                    <button
+                        className="icon-btn theme-btn"
+                        onClick={() => setTheme(t => t === "dark" ? "light" : "dark")}
+                        title={theme === "dark" ? "Switch to light mode" : "Switch to dark mode"}
+                        aria-label={theme === "dark" ? "Switch to light mode" : "Switch to dark mode"}
+                    >
+                        {theme === "dark" ? (
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                                <circle cx="12" cy="12" r="4" />
+                                <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41" />
+                            </svg>
+                        ) : (
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                                <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" />
+                            </svg>
+                        )}
+                    </button>
                     <button
                         className="icon-btn search-btn"
                         onClick={() => setSearchOpen(true)}

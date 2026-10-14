@@ -28,6 +28,34 @@
     --display: 'Oswald', 'Inter', system-ui, sans-serif;
     --body: 'Inter', system-ui, -apple-system, sans-serif;
     --mono: 'JetBrains Mono', ui-monospace, monospace;
+    color-scheme: light;
+}
+:root[data-theme="dark"] {
+    --bg: #0F1216;
+    --bg-grad: #0F1216;
+    --surface: #171B21;
+    --surface-2: #1E232B;
+    --surface-3: #262C36;
+    --border: #2A313D;
+    --border-strong: #3B4453;
+    --text: #E8EAED;
+    --text-dim: #9AA3AF;
+    --accent: #EF4444;
+    --accent-hover: #F87171;
+    --accent-glow: rgba(239, 68, 68, 0.22);
+    --accent-2: #818CF8;
+    --success: #4ADE80;
+    --danger: #F87171;
+    --cat-1: #F87171;
+    --cat-2: #FBBF24;
+    --cat-3: #60A5FA;
+    --team-a: #FB923C;
+    --team-b: #60A5FA;
+    --team-c: #4ADE80;
+    --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.45);
+    --shadow-md: 0 1px 3px rgba(0, 0, 0, 0.5), 0 4px 12px rgba(0, 0, 0, 0.4);
+    --shadow-lg: 0 2px 6px rgba(0, 0, 0, 0.55), 0 14px 32px rgba(0, 0, 0, 0.55);
+    color-scheme: dark;
 }
 * { box-sizing: border-box; }
 body {
