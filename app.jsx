@@ -642,7 +642,10 @@ function MatchCard({ match, index }) {
 
 // Bell-like chime that plays for ~4 seconds when the timer expires.
 // No audio file — synthesised in-browser via Web Audio API.
+// Also pulses the device vibrator on mobile, matching the arpeggio cadence
+// so a phone in a pocket still conveys the match / timeout end.
 const playTimerAlarm = () => {
+    try { navigator.vibrate?.([220, 120, 220, 120, 220, 180, 500]); } catch {}
     try {
         const Ctx = window.AudioContext || window.webkitAudioContext;
         if (!Ctx) return;
@@ -686,6 +689,111 @@ const playTimerAlarm = () => {
     }
 };
 
+// Short triumphant flourish for match end — different timbre from the bell alarm
+// so a watcher can tell "match over" apart from "time's up / timeout done".
+const playVictoryFanfare = () => {
+    try { navigator.vibrate?.([80, 60, 80, 60, 260]); } catch {}
+    try {
+        const Ctx = window.AudioContext || window.webkitAudioContext;
+        if (!Ctx) return;
+        const ctx = new Ctx();
+        const now = ctx.currentTime;
+        const tone = (startAt, freq, dur = 0.32, vol = 0.3) => {
+            const osc = ctx.createOscillator();
+            const gain = ctx.createGain();
+            osc.type = "triangle";
+            osc.frequency.value = freq;
+            gain.gain.setValueAtTime(0, startAt);
+            gain.gain.linearRampToValueAtTime(vol, startAt + 0.015);
+            gain.gain.exponentialRampToValueAtTime(0.001, startAt + dur);
+            osc.connect(gain).connect(ctx.destination);
+            osc.start(startAt);
+            osc.stop(startAt + dur);
+        };
+        tone(now,        523.25);
+        tone(now + 0.13, 659.25);
+        tone(now + 0.26, 783.99);
+        tone(now + 0.42, 1046.50, 0.75, 0.35);
+        setTimeout(() => ctx.close().catch(() => {}), 1800);
+    } catch {}
+};
+
+const CONFETTI_COLORS = ["#F59E0B", "#EF4444", "#3B82F6", "#10B981", "#8B5CF6", "#EC4899", "#F97316", "#06B6D4"];
+
+function WinnerCelebration({ isTie, winnerName, winnerScore, loserName, loserScore, winnerColor, onDismiss }) {
+    useEffect(() => {
+        const t = setTimeout(onDismiss, 4800);
+        return () => clearTimeout(t);
+    }, [onDismiss]);
+
+    // Pieces are stable per mount so they fall deterministically, not re-randomised each paint.
+    const pieces = useMemo(() => (
+        Array.from({ length: 72 }, (_, i) => ({
+            left: Math.random() * 100,
+            delay: Math.random() * 0.9,
+            duration: 2.2 + Math.random() * 1.8,
+            drift: (Math.random() - 0.5) * 160,
+            color: CONFETTI_COLORS[i % CONFETTI_COLORS.length],
+            rotation: Math.random() * 360,
+            spin: 360 + Math.random() * 720,
+            shape: i % 3,
+        }))
+    ), []);
+
+    return (
+        <div className="winner-celebration" onClick={onDismiss} role="dialog" aria-live="polite">
+            <div className="winner-confetti" aria-hidden="true">
+                {pieces.map((p, i) => (
+                    <span
+                        key={i}
+                        className={`confetti-piece shape-${p.shape}`}
+                        style={{
+                            left: `${p.left}%`,
+                            background: p.color,
+                            animationDelay: `${p.delay}s`,
+                            animationDuration: `${p.duration}s`,
+                            "--rot": `${p.rotation}deg`,
+                            "--spin": `${p.spin}deg`,
+                            "--drift": `${p.drift}px`,
+                        }}
+                    />
+                ))}
+            </div>
+            <div
+                className={`winner-card${isTie ? " tie" : ""}`}
+                style={{ "--winner-color": winnerColor || "#F59E0B" }}
+                onClick={e => e.stopPropagation()}
+            >
+                {isTie ? (
+                    <>
+                        <div className="winner-emoji">🤝</div>
+                        <div className="winner-label">It's a tie</div>
+                        <div className="winner-name">{winnerName} <span className="winner-vs-inline">vs</span> {loserName}</div>
+                        <div className="winner-score">
+                            <span>{winnerScore}</span>
+                            <span className="winner-score-sep">—</span>
+                            <span>{loserScore}</span>
+                        </div>
+                    </>
+                ) : (
+                    <>
+                        <div className="winner-emoji">🏆</div>
+                        <div className="winner-label">Winner</div>
+                        <div className="winner-name">{winnerName}</div>
+                        <div className="winner-score">
+                            <span className="winner-score-win">{winnerScore}</span>
+                            <span className="winner-score-sep">—</span>
+                            <span className="winner-score-lose">{loserScore}</span>
+                        </div>
+                        {loserName && <div className="winner-vs">vs {loserName}</div>}
+                    </>
+                )}
+                <div className="winner-dismiss-hint">Tap anywhere to dismiss</div>
+            </div>
+        </div>
+    );
+}
+
 function Scoreboard({ session, teams, onUpdate, onEndMatch, onSaveSession, showToast, canEdit, matchDurationMin, timeoutDurationMin }) {
     const teamLabels = teams.map((_, i) => String.fromCharCode(65 + i));
     const sb = session.scoreboard || {};
@@ -701,6 +809,7 @@ function Scoreboard({ session, teams, onUpdate, onEndMatch, onSaveSession, showT
     const timeoutsUsedB = sb.timeoutsUsedB || 0;
 
     const [now, setNow] = useState(() => Date.now());
+    const [celebration, setCelebration] = useState(null);
     const alarmFiredRef = useRef(false);
     const toAlarmFiredRef = useRef(false);
 
@@ -725,6 +834,9 @@ function Scoreboard({ session, teams, onUpdate, onEndMatch, onSaveSession, showT
     const timerPaused = canEdit && !running && elapsedSec > 0 && !timeExpired && !timeoutTeam;
     const toMM = Math.floor(timeoutT.remainingSec / 60);
     const toSS = timeoutT.remainingSec % 60;
+
+    // Weekly uses fixed team colors A/B/C — hoisted so endMatch can tint the celebration.
+    const weeklyTeamColor = (idx) => ["#C2410C", "#1D4ED8", "#047857"][idx % 3];
 
     // Auto-pause the main timer when it hits 0 (owner writes, everyone plays alarm once).
     useEffect(() => {
@@ -867,6 +979,19 @@ function Scoreboard({ session, teams, onUpdate, onEndMatch, onSaveSession, showT
         } else if (!confirm("End this match? Score will be saved to the session.")) {
             return;
         }
+        const nameA = `Team ${teamLabels[teamIdxA]}`;
+        const nameB = `Team ${teamLabels[teamIdxB]}`;
+        const isTie = scoreA === scoreB;
+        const aWon = scoreA > scoreB;
+        setCelebration({
+            isTie,
+            winnerName: isTie ? nameA : (aWon ? nameA : nameB),
+            winnerScore: isTie ? scoreA : (aWon ? scoreA : scoreB),
+            loserName: isTie ? nameB : (aWon ? nameB : nameA),
+            loserScore: isTie ? scoreB : (aWon ? scoreB : scoreA),
+            winnerColor: isTie ? null : weeklyTeamColor(aWon ? teamIdxA : teamIdxB),
+        });
+        playVictoryFanfare();
         onEndMatch({
             id: uid(),
             teamIdxA, teamIdxB,
@@ -879,8 +1004,6 @@ function Scoreboard({ session, teams, onUpdate, onEndMatch, onSaveSession, showT
         showToast?.("Match recorded");
     };
 
-    // Weekly uses fixed team colors A/B/C.
-    const weeklyTeamColor = (idx) => ["#C2410C", "#1D4ED8", "#047857"][idx % 3];
     const timeoutColor = timeoutTeam
         ? weeklyTeamColor(timeoutTeam === "A" ? teamIdxA : teamIdxB)
         : null;
@@ -933,6 +1056,7 @@ function Scoreboard({ session, teams, onUpdate, onEndMatch, onSaveSession, showT
     return (
         <div className="card">
             <h2>Scoreboard</h2>
+            {celebration && <WinnerCelebration {...celebration} onDismiss={() => setCelebration(null)} />}
             {timeoutTeam && (
                 <div
                     className="timeout-banner"
@@ -2923,6 +3047,7 @@ function TournamentScoreboard({ tournament, patchTournament, showToast, scorerKe
     const timeoutDurationMin = tournament.timeoutDurationMin || DEFAULT_TIMEOUT_MIN;
 
     const [now, setNow] = useState(() => Date.now());
+    const [celebration, setCelebration] = useState(null);
     const alarmFiredRef = useRef(false);
     const toAlarmFiredRef = useRef(false);
 
@@ -3090,6 +3215,21 @@ function TournamentScoreboard({ tournament, patchTournament, showToast, scorerKe
         } else if (!confirm("End this match? Score will be saved to the tournament.")) {
             return;
         }
+        const idxA = teams.findIndex(t => t.id === teamAId);
+        const idxB = teams.findIndex(t => t.id === teamBId);
+        const nameA = teams[idxA]?.name || "Team A";
+        const nameB = teams[idxB]?.name || "Team B";
+        const isTie = scoreA === scoreB;
+        const aWon = scoreA > scoreB;
+        setCelebration({
+            isTie,
+            winnerName: isTie ? nameA : (aWon ? nameA : nameB),
+            winnerScore: isTie ? scoreA : (aWon ? scoreA : scoreB),
+            loserName: isTie ? nameB : (aWon ? nameB : nameA),
+            loserScore: isTie ? scoreB : (aWon ? scoreB : scoreA),
+            winnerColor: isTie ? null : teamColor(aWon ? idxA : idxB),
+        });
+        playVictoryFanfare();
         patchTournament(t => {
             const nextActive = { ...(t.activeMatches || {}) };
             delete nextActive[slotKey];
@@ -3152,6 +3292,7 @@ function TournamentScoreboard({ tournament, patchTournament, showToast, scorerKe
     return (
         <div className="card">
             <h2>Record Match</h2>
+            {celebration && <WinnerCelebration {...celebration} onDismiss={() => setCelebration(null)} />}
             {timeoutTeam && (
                 <div
                     className="timeout-banner"
