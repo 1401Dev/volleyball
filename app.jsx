@@ -3948,6 +3948,158 @@ function TournamentView({ tournaments, setTournaments, rosterTemplates, setRoste
     );
 }
 
+function HomeView({ tournaments, onViewTournament, onGoLive, onGoTournaments }) {
+    const list = tournaments || [];
+
+    const isMatchLive = (m) => {
+        if (!m) return false;
+        if ((m.scoreA || 0) > 0 || (m.scoreB || 0) > 0) return true;
+        if ((m.timeoutsUsedA || 0) > 0 || (m.timeoutsUsedB || 0) > 0) return true;
+        if (m.timerRunning) return true;
+        if ((Number(m.timerAccumMs) || 0) > 0) return true;
+        if (m.timeoutTeam) return true;
+        return false;
+    };
+
+    const liveCount = list.reduce((n, t) => {
+        if (t.endedAt) return n;
+        if (t.kind === TOURNAMENT_KIND_ROSTER && t.teamsFinalized === false) return n;
+        const slots = Object.values(t.activeMatches || {}).filter(isMatchLive);
+        return n + slots.length;
+    }, 0);
+
+    const active = list
+        .filter(t => !t.endedAt)
+        .sort((a, b) => (b.date || "").localeCompare(a.date || ""));
+    const recent = list
+        .filter(t => t.endedAt)
+        .sort((a, b) => (b.endedAt || "").localeCompare(a.endedAt || ""))
+        .slice(0, 4);
+
+    const totalMatches = list.reduce((n, t) => n + ((t.matches || []).length), 0);
+
+    return (
+        <div className="home-view">
+            <div className="card home-hero">
+                <div className="home-hero-mark" aria-hidden="true">
+                    <svg viewBox="0 0 32 32" fill="none" stroke="#fff" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                        <circle cx="16" cy="16" r="12" fill="none" stroke="#fff" strokeWidth="2.2"/>
+                        <path d="M16 4c-3 4-4.5 9-3 12s5 6 10 7" />
+                        <path d="M28 16c-4-1-9 0-12 2s-5 6-4 10" />
+                        <path d="M16 28c0-5 2-9 5-11s7-2 11-1" />
+                    </svg>
+                </div>
+                <div className="home-hero-text">
+                    <div className="home-hero-eyebrow">Volleyball Club</div>
+                    <h1 className="home-hero-title">Welcome back.</h1>
+                    <p className="home-hero-sub">
+                        {liveCount > 0
+                            ? `${liveCount} match${liveCount === 1 ? "" : "es"} live right now.`
+                            : active.length > 0
+                                ? `${active.length} active tournament${active.length === 1 ? "" : "s"}.`
+                                : "Create a tournament to get started."}
+                    </p>
+                    <div className="home-hero-actions">
+                        <button className="btn" onClick={onGoLive}>
+                            {liveCount > 0 ? `See ${liveCount} live` : "Open Live"}
+                        </button>
+                        <button className="btn btn-secondary" onClick={onGoTournaments}>Tournaments</button>
+                    </div>
+                </div>
+            </div>
+
+            <div className="home-stats">
+                <div className={`home-stat${liveCount > 0 ? " is-live" : ""}`} onClick={onGoLive} role="button" tabIndex={0} onKeyDown={e => (e.key === "Enter" || e.key === " ") && onGoLive()}>
+                    <div className="home-stat-num">{liveCount}</div>
+                    <div className="home-stat-label">
+                        {liveCount > 0 && <span className="home-live-dot" aria-hidden="true"></span>}
+                        Live now
+                    </div>
+                </div>
+                <div className="home-stat" onClick={onGoTournaments} role="button" tabIndex={0} onKeyDown={e => (e.key === "Enter" || e.key === " ") && onGoTournaments()}>
+                    <div className="home-stat-num">{active.length}</div>
+                    <div className="home-stat-label">Active tournaments</div>
+                </div>
+                <div className="home-stat">
+                    <div className="home-stat-num">{totalMatches}</div>
+                    <div className="home-stat-label">Matches played</div>
+                </div>
+            </div>
+
+            <div className="card">
+                <div className="home-section-head">
+                    <h2 style={{ margin: 0 }}>Active tournaments</h2>
+                    {active.length > 0 && (
+                        <button className="btn-link" onClick={onGoTournaments}>View all →</button>
+                    )}
+                </div>
+                {active.length === 0 ? (
+                    <div className="empty">No active tournaments yet.</div>
+                ) : (
+                    <div className="home-tournament-grid">
+                        {active.slice(0, 6).map(t => {
+                            const slots = Object.values(t.activeMatches || {}).filter(isMatchLive);
+                            const teamsCount = (t.teams || []).length;
+                            const matchesPlayed = (t.matches || []).length;
+                            return (
+                                <button
+                                    key={t.id}
+                                    type="button"
+                                    className="home-tournament-card"
+                                    onClick={() => onViewTournament(t.id)}
+                                >
+                                    <div className="home-tournament-head">
+                                        <span className="home-tournament-name">{t.name}</span>
+                                        {slots.length > 0 && (
+                                            <span className="home-live-chip">
+                                                <span className="home-live-dot" aria-hidden="true"></span>
+                                                LIVE
+                                            </span>
+                                        )}
+                                    </div>
+                                    <div className="home-tournament-meta">
+                                        {t.date ? formatDate(t.date) : ""}
+                                    </div>
+                                    <div className="home-tournament-stats">
+                                        <span><strong>{teamsCount}</strong> teams</span>
+                                        <span><strong>{matchesPlayed}</strong> matches</span>
+                                        <span className="home-tournament-kind">
+                                            {t.kind === TOURNAMENT_KIND_ROSTER ? "Roster" : "Teams"}
+                                        </span>
+                                    </div>
+                                </button>
+                            );
+                        })}
+                    </div>
+                )}
+            </div>
+
+            {recent.length > 0 && (
+                <div className="card">
+                    <h2>Recently ended</h2>
+                    <div className="home-recent-list">
+                        {recent.map(t => (
+                            <button
+                                key={t.id}
+                                type="button"
+                                className="home-recent-row"
+                                onClick={() => onViewTournament(t.id)}
+                            >
+                                <span className="home-recent-name">{t.name}</span>
+                                <span className="home-recent-meta">
+                                    {(t.matches || []).length} matches
+                                    {t.endedAt && <span className="home-recent-dot">·</span>}
+                                    {t.endedAt && new Date(t.endedAt).toLocaleDateString()}
+                                </span>
+                            </button>
+                        ))}
+                    </div>
+                </div>
+            )}
+        </div>
+    );
+}
+
 function LiveView({ tournaments, setTournaments, onViewTournament, showToast }) {
     const tournamentList = tournaments || [];
     const canManage = typeof setTournaments === "function";
@@ -4542,7 +4694,7 @@ function App() {
     const [activeRosterId, setActiveRosterId] = useState(initial.activeRosterId);
     const [tournaments, setTournaments] = useState(initial.tournaments);
     const [rosterTemplates, setRosterTemplates] = useState(initial.rosterTemplates);
-    const [section, setSection] = useState("live");
+    const [section, setSection] = useState("home");
     const [tournamentTab, setTournamentTab] = useState("standings");
     const [selectedTournamentId, setSelectedTournamentId] = useState(null);
     const [toast, setToast] = useState(null);
@@ -4793,6 +4945,10 @@ function App() {
 
             <nav className="section-nav">
                 <button
+                    className={section === "home" ? "active" : ""}
+                    onClick={() => setSection("home")}
+                >Home</button>
+                <button
                     className={section === "live" ? "active" : ""}
                     onClick={() => setSection("live")}
                 >Live</button>
@@ -4803,7 +4959,14 @@ function App() {
             </nav>
             </div>
 
-            {section === "live" ? (
+            {section === "home" ? (
+                <HomeView
+                    tournaments={tournaments}
+                    onViewTournament={navigateToTournament}
+                    onGoLive={() => setSection("live")}
+                    onGoTournaments={() => setSection("tournament")}
+                />
+            ) : section === "live" ? (
                 <LiveView
                     key={activeRoster?.id + "-live"}
                     tournaments={tournaments}
