@@ -2161,7 +2161,10 @@ function RosterTeamsCard({ tournament, patchTournament, disabled }) {
     const scrollSettleTimerRef = useRef(null);
     const suppressScrollRef = useRef(false);
     const [teamsActiveIdx, setTeamsActiveIdx] = useState(0);
-    const useTeamsCarousel = teams.length >= 2;
+    // Admin reviewing draft teams (pre-finalize) sees all teams at once so
+    // they can judge the split before publishing. Everyone else (viewers, and
+    // the admin after publishing) gets the swipe carousel.
+    const useTeamsCarousel = teams.length >= 2 && !(canEdit && !finalized);
     useEffect(() => {
         if (teamsActiveIdx > teams.length - 1) {
             setTeamsActiveIdx(Math.max(0, teams.length - 1));
